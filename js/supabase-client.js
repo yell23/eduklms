@@ -146,6 +146,18 @@ function pushUserStateSupabase(email, stateObj) {
   }, 800); // debounce so rapid page-turns don't spam the network
 }
 
+async function pushUserStateSupabaseImmediate(email, stateObj) {
+  const sb = getClient();
+  if (!sb) return;
+  clearTimeout(_userStatePushTimer);
+  try {
+    await sb.from("user_state").upsert({ email, data: stateObj, updated_at: new Date().toISOString() });
+  } catch (e) {
+    console.warn("Immediate user_state sync failed:", e.message);
+  }
+}
+
+
 /* =========================================================
    USER ACCOUNTS (admin "Manage Users" panel — create/update/
    delete rows in the `users` table). Best-effort, mirrors the
@@ -285,6 +297,20 @@ function pushTeacherStudentStatsSupabase(id, statsObj) {
     } catch (e) { console.warn("Background student-stats sync to Supabase failed:", e.message); }
   }, 800);
 }
+
+async function pushTeacherStudentStatsSupabaseImmediate(id, statsObj) {
+  const sb = getClient();
+  if (!sb) return;
+  clearTimeout(_studentStatsPushTimer);
+  try {
+    await sb.from("teacher_students").update({
+      avg_score: statsObj.avgScore, progress: statsObj.progress, module_progress: statsObj.moduleProgress
+    }).eq("id", id);
+  } catch (e) {
+    console.warn("Immediate student-stats sync failed:", e.message);
+  }
+}
+
 
 /* =========================================================
    REALTIME — users & teacher_students

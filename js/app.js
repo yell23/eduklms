@@ -211,10 +211,15 @@ function getTeacherStudentModuleStatus(student, moduleId) {
   if (student.email && DB.perUser[student.email]) {
     const ud = DB.perUser[student.email];
     const p = ud.progress[moduleId];
-    if (!p) return { status: "not-started", score: null };
-    if (p.completed) return { status: "complete", score: ud.quizResults[moduleId]?.percentage || null };
-    if (p.currentPage > 0) return { status: "in-progress", score: null };
-    return { status: "not-started", score: null };
+    const mod = allModules()[moduleId];
+    const quizId = mod?.quizId;
+    const qResult = (quizId && ud.quizResults[quizId]) || ud.quizResults[moduleId];
+    const score = qResult?.percentage !== undefined ? qResult.percentage : null;
+
+    if (!p) return { status: "not-started", score };
+    if (p.completed) return { status: "complete", score: score !== null ? score : 100 };
+    if (p.currentPage > 0) return { status: "in-progress", score };
+    return { status: "not-started", score };
   }
   return student.moduleProgress?.[moduleId] || { status: "not-started", score: null };
 }
@@ -1220,6 +1225,61 @@ function handleViewClick(e) {
     "edit-announcement": () => openAnnouncementModal(id),
     "edit-assignment": () => openAssignmentModal(id),
     "view-student": () => viewStudentDetail(id),
+    "reset-module-reading": () => {
+      const mod = allModules()[id];
+      const title = mod ? mod.title : id;
+      if (confirm(`Reset booklet reading progress to Page 0 for "${title}" across all students & teacher preview?`)) {
+        resetClassModuleReading(id);
+      }
+    },
+    "reset-module-quiz": () => {
+      const mod = allModules()[id];
+      const title = mod ? mod.title : id;
+      if (confirm(`Reset quiz scores & attempts (3 attempts available) for "${title}" across all students?`)) {
+        resetClassModuleQuiz(id);
+      }
+    },
+    "reset-module-class-progress": () => {
+      const mod = allModules()[id];
+      const title = mod ? mod.title : id;
+      if (confirm(`Are you sure you want to reset FULL progress (Reading + Quiz) for "${title}"? All students' progress will be reset to 0%.`)) {
+        resetClassModuleProgress(id);
+      }
+    },
+    "reset-student-module-reading": () => {
+      const studentId = t.dataset.studentId;
+      const moduleId = t.dataset.moduleId;
+      const student = SEED.teacherStudents.find(s => s.id === studentId);
+      const mod = allModules()[moduleId];
+      if (confirm(`Reset booklet reading progress to Page 0 for "${mod?.title || moduleId}" for ${student?.name || 'this student'}?`)) {
+        resetStudentModuleReading(studentId, moduleId);
+      }
+    },
+    "reset-student-module-quiz": () => {
+      const studentId = t.dataset.studentId;
+      const moduleId = t.dataset.moduleId;
+      const student = SEED.teacherStudents.find(s => s.id === studentId);
+      const mod = allModules()[moduleId];
+      if (confirm(`Reset quiz score and attempts (3 attempts available) for "${mod?.title || moduleId}" for ${student?.name || 'this student'}?`)) {
+        resetStudentModuleQuiz(studentId, moduleId);
+      }
+    },
+    "reset-student-module": () => {
+      const studentId = t.dataset.studentId;
+      const moduleId = t.dataset.moduleId;
+      const student = SEED.teacherStudents.find(s => s.id === studentId);
+      const mod = allModules()[moduleId];
+      if (confirm(`Reset FULL progress (Reading + Quiz) for "${mod?.title || moduleId}" to 0% for ${student?.name || 'this student'}?`)) {
+        resetStudentModuleProgress(studentId, moduleId);
+      }
+    },
+    "reset-student-all-modules": () => {
+      const studentId = t.dataset.studentId;
+      const student = SEED.teacherStudents.find(s => s.id === studentId);
+      if (confirm(`Are you sure you want to reset ALL module progress to 0% for ${student?.name || 'this student'}?`)) {
+        resetStudentAllModules(studentId);
+      }
+    },
     "edit-user": () => editAdminUser(id),
     "delete-user": () => deleteUser(id),
     "clear-downloads": () => clearUserDownloads(),
@@ -1700,13 +1760,418 @@ function deleteUser(userId) {
   toast("User not found.", "warning");
 }
 
-function viewStudentDetail(studentId) {
+/* =========================================================
+   STUDENT DETAIL & PROGRESS RESET (TEACHER POV)
+========================================================= */
+function openStudentDetailModal(studentId) {
+  const modal = document.getElementById("modal-student-detail");
+  if (!modal) return;
   const student = SEED.teacherStudents.find(s => s.id === studentId);
   if (!student) { toast("Student not found.", "warning"); return; }
 
-  location.hash = `#/t-student/${studentId}`;
+  const ls = liveStudentStats(student);
+  const allMods = Object.values(allModules());
+
+  const nameEl = document.getElementById("student-detail-name");
+  const infoEl = document.getElementById("student-detail-info");
+  const tbody = document.getElementById("student-detail-modules-tbody");
+  const resetAllBtn = document.getElementById("student-detail-reset-all-btn");
+
+  if (nameEl) nameEl.textContent = `${student.name} — Progress Details`;
+  if (infoEl) infoEl.textContent = `Student ID: ${student.id} · Section: ${student.section} · Overall Progress: ${ls.progress}% · Avg. Score: ${ls.avgScore}%`;
+
+  const email = student.email;
+  const ud = (email && DB.perUser[email]) || { progress: {}, quizResults: {} };
+
+  if (tbody) {
+    tbody.innerHTML = allMods.map(m => {
+      const prog = getTeacherStudentModuleStatus(student, m.id);
+      const isDone = prog.status === "complete";
+      const isInProg = prog.status === "in-progress";
+      const scoreStr = prog.score !== null && prog.score !== undefined ? `${prog.score}%` : "";
+      const statusBadge = isDone
+        ? `<span class="pill pill-success">✓ Complete ${scoreStr ? `(${scoreStr})` : ''}</span>`
+        : isInProg
+          ? `<span class="pill pill-progress">⏳ In Progress</span>`
+          : `<span class="pill pill-muted">— Not Started</span>`;
+
+      const p = ud.progress[m.id];
+      const pageInfo = p ? `Page ${(p.currentPage || 0) + 1} of ${m.pages?.length || 1}` : 'Page 1';
+      const qResult = (m.quizId && ud.quizResults[m.quizId]) || ud.quizResults[m.id];
+      const quizInfo = qResult ? `${qResult.score}/${qResult.total} (${qResult.percentage}%) · ${qResult.attempts || 1}/3 attempts` : 'No quiz attempts';
+
+      return `
+        <tr>
+          <td>
+            <strong>Module ${m.number}:</strong> ${m.title}<br>
+            <span style="font-size:12px; color:var(--text-muted);">📖 ${pageInfo} · 📝 ${quizInfo}</span>
+          </td>
+          <td>${statusBadge}</td>
+          <td>
+            <div style="display:flex; gap:6px; flex-wrap:wrap;">
+              <button class="btn btn-outline btn-sm" data-action="reset-student-module-reading" data-student-id="${student.id}" data-module-id="${m.id}" title="Reset only reading position to Page 0">
+                📖 Reset Reading
+              </button>
+              <button class="btn btn-outline btn-sm" data-action="reset-student-module-quiz" data-student-id="${student.id}" data-module-id="${m.id}" title="Reset only quiz score & attempts to 0">
+                📝 Reset Quiz
+              </button>
+              <button class="btn btn-warning btn-sm" data-action="reset-student-module" data-student-id="${student.id}" data-module-id="${m.id}" title="Reset both reading and quiz to 0%">
+                ⚡ Reset Full (0%)
+              </button>
+            </div>
+          </td>
+        </tr>
+      `;
+    }).join("");
+  }
+
+  if (resetAllBtn) resetAllBtn.dataset.studentId = student.id;
+  modal.hidden = false;
+}
+
+function viewStudentDetail(studentId) {
+  openStudentDetailModal(studentId);
+}
+
+// 1. Reset Student Reading ONLY
+async function resetStudentModuleReading(studentId, moduleId) {
+  const student = SEED.teacherStudents.find(s => s.id === studentId);
+  const email = student?.email || Object.keys(SEED.users).find(e => SEED.users[e].id === studentId);
+  const mod = allModules()[moduleId];
+  const modTitle = mod ? mod.title : moduleId;
+
+  if (email && DB.perUser[email]) {
+    const ud = DB.perUser[email];
+    if (ud.progress) delete ud.progress[moduleId];
+    if (ud.completedModules) ud.completedModules = ud.completedModules.filter(id => id !== moduleId);
+    if (typeof pushUserStateSupabaseImmediate === "function") {
+      await pushUserStateSupabaseImmediate(email, ud);
+    }
+  }
+
+  if (student) {
+    if (!student.moduleProgress) student.moduleProgress = {};
+    const currScore = student.moduleProgress[moduleId]?.score || null;
+    student.moduleProgress[moduleId] = { status: "not-started", score: currScore };
+    const stats = liveStudentStats(student);
+    student.progress = stats.progress;
+    if (typeof pushTeacherStudentStatsSupabaseImmediate === "function") {
+      await pushTeacherStudentStatsSupabaseImmediate(student.id, {
+        avgScore: stats.avgScore,
+        progress: stats.progress,
+        moduleProgress: student.moduleProgress
+      });
+    }
+  }
+
+  persist();
+  toast(`Reading progress for "${modTitle}" reset to Page 0 for ${student ? student.name : 'student'}. ✓`, "success");
+  if (document.getElementById("modal-student-detail") && !document.getElementById("modal-student-detail").hidden) {
+    openStudentDetailModal(studentId);
+  }
   route();
 }
+
+// 2. Reset Student Quiz ONLY
+async function resetStudentModuleQuiz(studentId, moduleId) {
+  const student = SEED.teacherStudents.find(s => s.id === studentId);
+  const email = student?.email || Object.keys(SEED.users).find(e => SEED.users[e].id === studentId);
+  const mod = allModules()[moduleId];
+  const quizId = mod ? mod.quizId : null;
+  const modTitle = mod ? mod.title : moduleId;
+
+  if (email && DB.perUser[email]) {
+    const ud = DB.perUser[email];
+    if (ud.quizResults) {
+      if (moduleId in ud.quizResults) delete ud.quizResults[moduleId];
+      if (quizId && quizId in ud.quizResults) delete ud.quizResults[quizId];
+      Object.keys(allQuizzes()).forEach(qid => {
+        if (allQuizzes()[qid].moduleId === moduleId) delete ud.quizResults[qid];
+      });
+    }
+    if (ud.shortAnswers) {
+      if (ud.shortAnswers[moduleId]) delete ud.shortAnswers[moduleId];
+      if (quizId && ud.shortAnswers[quizId]) delete ud.shortAnswers[quizId];
+    }
+    if (typeof pushUserStateSupabaseImmediate === "function") {
+      await pushUserStateSupabaseImmediate(email, ud);
+    }
+  }
+
+  if (student) {
+    if (!student.moduleProgress) student.moduleProgress = {};
+    const currStatus = student.moduleProgress[moduleId]?.status || "not-started";
+    student.moduleProgress[moduleId] = { status: currStatus === "complete" ? "in-progress" : currStatus, score: null };
+    const stats = liveStudentStats(student);
+    student.avgScore = stats.avgScore;
+    if (typeof pushTeacherStudentStatsSupabaseImmediate === "function") {
+      await pushTeacherStudentStatsSupabaseImmediate(student.id, {
+        avgScore: stats.avgScore,
+        progress: stats.progress,
+        moduleProgress: student.moduleProgress
+      });
+    }
+  }
+
+  persist();
+  toast(`Quiz attempts & score for "${modTitle}" reset to 0 (3 attempts available) for ${student ? student.name : 'student'}. ✓`, "success");
+  if (document.getElementById("modal-student-detail") && !document.getElementById("modal-student-detail").hidden) {
+    openStudentDetailModal(studentId);
+  }
+  route();
+}
+
+// 3. Reset Single student Full (Reading + Quiz)
+async function resetStudentModuleProgress(studentId, moduleId) {
+  const student = SEED.teacherStudents.find(s => s.id === studentId);
+  const email = student?.email || Object.keys(SEED.users).find(e => SEED.users[e].id === studentId);
+  const mod = allModules()[moduleId];
+  const quizId = mod ? mod.quizId : null;
+  const modTitle = mod ? mod.title : moduleId;
+
+  if (email && DB.perUser[email]) {
+    const ud = DB.perUser[email];
+    if (ud.progress && ud.progress[moduleId]) delete ud.progress[moduleId];
+    if (ud.completedModules) ud.completedModules = ud.completedModules.filter(id => id !== moduleId);
+    
+    // Clear quiz results (keyed by quizId or moduleId)
+    if (ud.quizResults) {
+      if (moduleId in ud.quizResults) delete ud.quizResults[moduleId];
+      if (quizId && quizId in ud.quizResults) delete ud.quizResults[quizId];
+      Object.keys(allQuizzes()).forEach(qid => {
+        if (allQuizzes()[qid].moduleId === moduleId) delete ud.quizResults[qid];
+      });
+    }
+    if (ud.shortAnswers) {
+      if (ud.shortAnswers[moduleId]) delete ud.shortAnswers[moduleId];
+      if (quizId && ud.shortAnswers[quizId]) delete ud.shortAnswers[quizId];
+    }
+
+    if (typeof pushUserStateSupabaseImmediate === "function") {
+      await pushUserStateSupabaseImmediate(email, ud);
+    }
+  }
+
+  if (student) {
+    if (!student.moduleProgress) student.moduleProgress = {};
+    student.moduleProgress[moduleId] = { status: "not-started", score: null };
+    const stats = liveStudentStats(student);
+    student.progress = stats.progress;
+    student.avgScore = stats.avgScore;
+
+    if (typeof pushTeacherStudentStatsSupabaseImmediate === "function") {
+      await pushTeacherStudentStatsSupabaseImmediate(student.id, {
+        avgScore: stats.avgScore,
+        progress: stats.progress,
+        moduleProgress: student.moduleProgress
+      });
+    }
+  }
+
+  persist();
+  toast(`Full progress & Quiz for "${modTitle}" reset to 0% for ${student ? student.name : 'student'}. ✓`, "success");
+
+  // If modal is open, refresh modal view
+  const modal = document.getElementById("modal-student-detail");
+  if (modal && !modal.hidden) {
+    openStudentDetailModal(studentId);
+  }
+  route();
+}
+
+// 4. Reset single student across ALL modules
+async function resetStudentAllModules(studentId) {
+  const student = SEED.teacherStudents.find(s => s.id === studentId);
+  const email = student?.email || Object.keys(SEED.users).find(e => SEED.users[e].id === studentId);
+
+  if (email && DB.perUser[email]) {
+    const ud = DB.perUser[email];
+    ud.progress = {};
+    ud.completedModules = [];
+    ud.quizResults = {};
+    ud.shortAnswers = {};
+
+    if (typeof pushUserStateSupabaseImmediate === "function") {
+      await pushUserStateSupabaseImmediate(email, ud);
+    }
+  }
+
+  if (student) {
+    student.moduleProgress = {};
+    student.progress = 0;
+    student.avgScore = 0;
+
+    if (typeof pushTeacherStudentStatsSupabaseImmediate === "function") {
+      await pushTeacherStudentStatsSupabaseImmediate(student.id, {
+        avgScore: 0,
+        progress: 0,
+        moduleProgress: {}
+      });
+    }
+  }
+
+  persist();
+  toast(`All module and quiz progress has been reset to 0% for ${student ? student.name : 'student'}. ✓`, "success");
+
+  const modal = document.getElementById("modal-student-detail");
+  if (modal && !modal.hidden) {
+    openStudentDetailModal(studentId);
+  }
+  route();
+}
+
+// 5. Reset Class Reading ONLY
+async function resetClassModuleReading(moduleId) {
+  const mod = allModules()[moduleId];
+  const modTitle = mod ? mod.title : moduleId;
+
+  // Reset in perUser for all users (including teacher preview)
+  const emails = Object.keys(DB.perUser || {});
+  for (const email of emails) {
+    const ud = DB.perUser[email];
+    let changed = false;
+    if (ud.progress && ud.progress[moduleId]) {
+      delete ud.progress[moduleId];
+      changed = true;
+    }
+    if (ud.completedModules && ud.completedModules.includes(moduleId)) {
+      ud.completedModules = ud.completedModules.filter(id => id !== moduleId);
+      changed = true;
+    }
+    if (changed && typeof pushUserStateSupabaseImmediate === "function") {
+      await pushUserStateSupabaseImmediate(email, ud);
+    }
+  }
+
+  for (const student of SEED.teacherStudents) {
+    if (!student.moduleProgress) student.moduleProgress = {};
+    const currScore = student.moduleProgress[moduleId]?.score || null;
+    student.moduleProgress[moduleId] = { status: "not-started", score: currScore };
+    const stats = liveStudentStats(student);
+    student.progress = stats.progress;
+    if (typeof pushTeacherStudentStatsSupabaseImmediate === "function") {
+      await pushTeacherStudentStatsSupabaseImmediate(student.id, {
+        avgScore: stats.avgScore,
+        progress: stats.progress,
+        moduleProgress: student.moduleProgress
+      });
+    }
+  }
+
+  persist();
+  toast(`Reading progress for "${modTitle}" reset to Page 0 for all students & preview accounts. ✓`, "success");
+  route();
+}
+
+// 6. Reset Class Quizzes ONLY
+async function resetClassModuleQuiz(moduleId) {
+  const mod = allModules()[moduleId];
+  const quizId = mod ? mod.quizId : null;
+  const modTitle = mod ? mod.title : moduleId;
+
+  const emails = Object.keys(DB.perUser || {});
+  for (const email of emails) {
+    const ud = DB.perUser[email];
+    let changed = false;
+    if (ud.quizResults) {
+      if (moduleId in ud.quizResults) { delete ud.quizResults[moduleId]; changed = true; }
+      if (quizId && quizId in ud.quizResults) { delete ud.quizResults[quizId]; changed = true; }
+      Object.keys(allQuizzes()).forEach(qid => {
+        if (allQuizzes()[qid].moduleId === moduleId && ud.quizResults[qid]) {
+          delete ud.quizResults[qid];
+          changed = true;
+        }
+      });
+    }
+    if (ud.shortAnswers) {
+      if (ud.shortAnswers[moduleId]) { delete ud.shortAnswers[moduleId]; changed = true; }
+      if (quizId && ud.shortAnswers[quizId]) { delete ud.shortAnswers[quizId]; changed = true; }
+    }
+    if (changed && typeof pushUserStateSupabaseImmediate === "function") {
+      await pushUserStateSupabaseImmediate(email, ud);
+    }
+  }
+
+  for (const student of SEED.teacherStudents) {
+    if (!student.moduleProgress) student.moduleProgress = {};
+    const currStatus = student.moduleProgress[moduleId]?.status || "not-started";
+    student.moduleProgress[moduleId] = { status: currStatus === "complete" ? "in-progress" : currStatus, score: null };
+    const stats = liveStudentStats(student);
+    student.avgScore = stats.avgScore;
+    if (typeof pushTeacherStudentStatsSupabaseImmediate === "function") {
+      await pushTeacherStudentStatsSupabaseImmediate(student.id, {
+        avgScore: stats.avgScore,
+        progress: stats.progress,
+        moduleProgress: student.moduleProgress
+      });
+    }
+  }
+
+  persist();
+  toast(`Quiz attempts & scores for "${modTitle}" reset to 0 (3 attempts available) for all students. ✓`, "success");
+  route();
+}
+
+// 7. Reset ALL students' progress for a specific module (Class-wide full reset)
+async function resetClassModuleProgress(moduleId) {
+  const mod = allModules()[moduleId];
+  const quizId = mod ? mod.quizId : null;
+  const modTitle = mod ? mod.title : moduleId;
+
+  // Reset in perUser for each user (including teacher preview)
+  const emails = Object.keys(DB.perUser || {});
+  for (const email of emails) {
+    const ud = DB.perUser[email];
+    let changed = false;
+    if (ud.progress && ud.progress[moduleId]) {
+      delete ud.progress[moduleId];
+      changed = true;
+    }
+    if (ud.completedModules && ud.completedModules.includes(moduleId)) {
+      ud.completedModules = ud.completedModules.filter(id => id !== moduleId);
+      changed = true;
+    }
+    if (ud.quizResults) {
+      if (moduleId in ud.quizResults) { delete ud.quizResults[moduleId]; changed = true; }
+      if (quizId && quizId in ud.quizResults) { delete ud.quizResults[quizId]; changed = true; }
+      Object.keys(allQuizzes()).forEach(qid => {
+        if (allQuizzes()[qid].moduleId === moduleId && ud.quizResults[qid]) {
+          delete ud.quizResults[qid];
+          changed = true;
+        }
+      });
+    }
+    if (ud.shortAnswers) {
+      if (ud.shortAnswers[moduleId]) { delete ud.shortAnswers[moduleId]; changed = true; }
+      if (quizId && ud.shortAnswers[quizId]) { delete ud.shortAnswers[quizId]; changed = true; }
+    }
+    if (changed && typeof pushUserStateSupabaseImmediate === "function") {
+      await pushUserStateSupabaseImmediate(email, ud);
+    }
+  }
+
+  // Reset in SEED.teacherStudents roster
+  for (const student of SEED.teacherStudents) {
+    if (!student.moduleProgress) student.moduleProgress = {};
+    student.moduleProgress[moduleId] = { status: "not-started", score: null };
+    const stats = liveStudentStats(student);
+    student.progress = stats.progress;
+    student.avgScore = stats.avgScore;
+
+    if (typeof pushTeacherStudentStatsSupabaseImmediate === "function") {
+      await pushTeacherStudentStatsSupabaseImmediate(student.id, {
+        avgScore: stats.avgScore,
+        progress: stats.progress,
+        moduleProgress: student.moduleProgress
+      });
+    }
+  }
+
+  persist();
+  toast(`Class progress & quizzes for "${modTitle}" reset to 0% for all students & preview accounts. ✓`, "success");
+  route();
+}
+
 
 let editingUserId = null;
 function openUserModal(userId = null) {
@@ -2528,19 +2993,27 @@ function renderQuizzesList() {
       ${quizIds.map(qid => {
     const quiz = allQuizzes()[qid];
     if (!quiz) return "";
-    const mod = allModules()[quiz.moduleId];
     const subject = allSubjects()[quiz.subjectId] || { name: "Subject" };
     const result = ud.quizResults[qid];
+    const attempts = result?.attempts || 0;
+    const attemptsLeft = Math.max(0, 3 - attempts);
+    const maxReached = !result?.passed && attempts >= 3;
+
     return `
         <div class="card module-card">
           <div class="module-num">${svgIcon("quiz")}</div>
           <div class="module-card-body">
             <h4>${quiz.title}</h4>
             <p>${subject.name} · ${quiz.questions.length} items</p>
+            <div style="font-size:12px; color:var(--text-muted); margin-top:4px;">
+              ${result ? (result.passed ? '✓ Passed' : (maxReached ? '🚫 0 attempts left (3/3 used)' : `⏳ ${attemptsLeft} attempt(s) remaining`)) : '3 attempts available'}
+            </div>
           </div>
           <div class="module-actions">
             ${result ? `<span class="pill ${result.passed ? 'pill-success' : 'pill-danger'}">${result.percentage}% · ${result.passed ? 'Passed' : 'Failed'}</span>` : `<span class="pill pill-muted">Not attempted</span>`}
-            <button class="btn ${result ? 'btn-outline' : 'btn-primary'} btn-sm" data-action="open-quiz" data-id="${qid}">${result ? 'Retry' : 'Start Quiz'}</button>
+            ${maxReached 
+              ? `<button class="btn btn-outline btn-sm" disabled style="opacity:0.6; cursor:not-allowed;" title="Maximum attempts reached. Ask teacher to reset.">No Attempts Left</button>`
+              : `<button class="btn ${result ? 'btn-outline' : 'btn-primary'} btn-sm" data-action="open-quiz" data-id="${qid}">${result ? (result.passed ? 'Review Quiz' : `Retry (${attemptsLeft} left)`) : 'Start Quiz'}</button>`}
           </div>
         </div>`;
   }).filter(Boolean).join("")}
@@ -2551,6 +3024,37 @@ function renderQuizzesList() {
 function renderQuizAttempt(quizId) {
   const quiz = allQuizzes()[quizId];
   if (!quiz) return `<div class="empty-state"><h3>Quiz not found</h3><p><a href="#/quizzes">Back to Quizzes</a></p></div>`;
+  
+  const ud = userData();
+  const result = ud.quizResults[quizId];
+  const attempts = result?.attempts || 0;
+  
+  // If student failed and already used all 3 attempts, block access
+  if (result && !result.passed && attempts >= 3) {
+    return `
+      <div class="quiz-shell">
+        <div class="card empty-state" style="padding:40px 20px; text-align:center;">
+          <div style="font-size:44px; margin-bottom:12px;">🚫</div>
+          <h3>Maximum Quiz Attempts Reached</h3>
+          <p style="color:var(--text-muted); max-width:440px; margin:12px auto 24px; font-size:14px; line-height:1.6;">
+            You have already used all <strong>3 of 3 attempts</strong> for <strong>${quiz.title}</strong>.<br>
+            Please contact your teacher if you need this quiz progress reset.
+          </p>
+          <div style="display:flex; gap:10px; justify-content:center;">
+            <a href="#/quizzes" class="btn btn-primary">Back to Quizzes</a>
+            <a href="#/subject/${quiz.subjectId}" class="btn btn-outline">Back to Subject</a>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  // If already passed, go directly to review results
+  if (result && result.passed) {
+    location.hash = `#/quiz-result/${quizId}`;
+    return "";
+  }
+
   quizState = { quizId, index: 0, answers: new Array(quiz.questions.length).fill(null), submitted: false };
   return quizQuestionHTML();
 }
@@ -2561,6 +3065,9 @@ function quizQuestionHTML() {
   const q = quiz.questions[quizState.index];
   const letters = ["A", "B", "C", "D"];
   const selected = quizState.answers[quizState.index];
+  const ud = userData();
+  const prevAttempts = ud.quizResults[quiz.id]?.attempts || 0;
+  const currentAttemptNum = prevAttempts + 1;
 
   let optionsHTML = "";
   if (q.type === "short") {
@@ -2587,7 +3094,7 @@ function quizQuestionHTML() {
   return `
     <div class="quiz-shell">
       <div class="quiz-progress-row">
-        <span>Q${quizState.index + 1}/${quiz.questions.length}</span>
+        <span>Q${quizState.index + 1}/${quiz.questions.length} · <strong style="color:var(--primary);">Attempt ${currentAttemptNum}/3</strong></span>
         <div class="progress-track"><div class="progress-fill" style="width:${Math.round(((quizState.index + 1) / quiz.questions.length) * 100)}%"></div></div>
       </div>
       <div class="card quiz-q-card">
@@ -2616,6 +3123,7 @@ function stepQuiz(dir) {
   quizState.index = next;
   document.getElementById("view").innerHTML = `<div class="page-fade">${quizQuestionHTML()}</div>`;
 }
+
 function submitQuiz() {
   const quiz = allQuizzes()[quizState.quizId];
   let correct = 0;
@@ -2632,30 +3140,43 @@ function submitQuiz() {
   });
 
   const percentage = scorableTotal > 0 ? Math.round((correct / scorableTotal) * 100) : 100;
-  const passed = percentage >= 60;
+  const passed = percentage >= 60; // 60% passing score
   const ud = userData();
+  const prevAttempts = (ud.quizResults[quiz.id]?.attempts) || 0;
+  const attempts = prevAttempts + 1;
+
   ud.quizResults[quiz.id] = {
     score: correct,
     total: scorableTotal,
     shortCount: shortAnswerCount,
     percentage,
     passed,
+    attempts,
     date: Date.now(),
     answers: [...quizState.answers]
   };
-  markModuleComplete(quiz.moduleId);
+
+  // Only mark the module complete if the student PASSED the quiz
+  if (passed) {
+    markModuleComplete(quiz.moduleId);
+  }
+  
   persist();
   location.hash = `#/quiz-result/${quiz.id}`;
 }
 
 function renderQuizResult(quizId) {
-  const quiz = SEED.quizzes[quizId];
+  const quiz = allQuizzes()[quizId];
+  if (!quiz) return `<div class="empty-state"><h3>Quiz not found</h3><p><a href="#/quizzes">Back to Quizzes</a></p></div>`;
   const ud = userData();
   const result = ud.quizResults[quizId];
   if (!result) { location.hash = `#/quiz/${quizId}`; return ""; }
   const circumference = 2 * Math.PI * 60;
   const dash = circumference * (result.percentage / 100);
   const color = result.passed ? "var(--accent)" : "var(--danger)";
+  const attempts = result.attempts || 1;
+  const attemptsLeft = Math.max(0, 3 - attempts);
+  const canRetry = !result.passed && attemptsLeft > 0;
 
   return `
     <div class="quiz-shell">
@@ -2669,37 +3190,73 @@ function renderQuizResult(quizId) {
           <span class="pct">${result.percentage}%</span>
           <span class="of">${result.score}/${result.total} correct</span>
         </div>
-        <h3>${result.passed ? "Nice work — you passed!" : "Keep practicing!"}</h3>
+        <h3>${result.passed ? "🎉 Congratulations — You Passed!" : (attemptsLeft > 0 ? "Keep practicing!" : "Quiz Ended — No Attempts Left")}</h3>
         <p style="color:var(--text-muted); margin-top:6px; font-size:13.5px;">${quiz.title}</p>
+
         <div class="quiz-result-stats">
-          <div class="quiz-result-stat"><div class="n">${result.score}</div><div class="l">Auto-Graded</div></div>
-          <div class="quiz-result-stat"><div class="n">${result.shortCount || 0}</div><div class="l">For Review</div></div>
-          <div class="quiz-result-stat"><div class="n">${result.passed ? "Passed" : "Failed"}</div><div class="l">Status</div></div>
+          <div class="quiz-result-stat"><div class="n">${result.score}/${result.total}</div><div class="l">Score</div></div>
+          <div class="quiz-result-stat"><div class="n">${attempts}/3</div><div class="l">Attempts Used</div></div>
+          <div class="quiz-result-stat"><div class="n">${result.passed ? "Passed ✓" : "Failed ✗"}</div><div class="l">Status</div></div>
         </div>
+
+        ${!result.passed ? `
+          <div style="background:var(--surface-alt); border:1px solid var(--border); border-radius:var(--radius-sm); padding:14px 18px; margin:16px 0; text-align:center; font-size:13px; line-height:1.5;">
+            ${attemptsLeft > 0 
+              ? `⚠️ You did not pass. You have <strong>${attemptsLeft} attempt(s) remaining</strong>.<br><span style="color:var(--text-faint);">🔒 Notice: Correct answers are hidden until you successfully pass the quiz.</span>` 
+              : `🚫 You have used all <strong>3 of 3 attempts</strong>.<br><span style="color:var(--text-faint);">Please ask your teacher to reset this quiz if you need another attempt.</span>`}
+          </div>
+        ` : `
+          <div style="background:var(--accent-soft); color:var(--accent); border-radius:var(--radius-sm); padding:14px 18px; margin:16px 0; text-align:center; font-size:13px; font-weight:600;">
+            ✓ Great job! You passed the quiz. You can now view the full answer key below.
+          </div>
+        `}
 
         <div class="quiz-review">
           ${quiz.questions.map((q, i) => {
-    if (q.type === "short") {
-      const ans = result.answers[i] || "(No answer provided)";
-      return `<div class="quiz-review-item short-review">
-                ${svgIcon("clipboard")}
-                <div style="flex:1;">
-                  <strong>Q${i + 1}. (Written Question)</strong> ${q.q}<br>
-                  <div class="short-answer-response"><strong>Your Answer:</strong> "${ans}"</div>
-                  <span class="pill pill-warning" style="margin-top:6px; display:inline-block;">Submitted for Teacher Review</span>
-                </div>
-              </div>`;
-    }
-    const ok = result.answers[i] === q.answer;
-    return `<div class="quiz-review-item ${ok ? 'ok' : 'bad'}">${svgIcon(ok ? "check" : "quiz")}
-              <div><strong>Q${i + 1}.</strong> ${q.q}<br><span style="color:var(--text-muted);">Correct answer: ${q.choices[q.answer]}</span></div>
-            </div>`;
-  }).join("")}
+            if (q.type === "short") {
+              const ans = result.answers[i] || "(No answer provided)";
+              return `<div class="quiz-review-item short-review">
+                        ${svgIcon("clipboard")}
+                        <div style="flex:1;">
+                          <strong>Q${i + 1}. (Written Question)</strong> ${q.q}<br>
+                          <div class="short-answer-response"><strong>Your Answer:</strong> "${ans}"</div>
+                          <span class="pill pill-warning" style="margin-top:6px; display:inline-block;">Submitted for Teacher Review</span>
+                        </div>
+                      </div>`;
+            }
+
+            const isCorrect = result.answers[i] === q.answer;
+            const chosenChoice = (result.answers[i] !== null && result.answers[i] !== undefined) ? q.choices[result.answers[i]] : "No answer selected";
+
+            if (result.passed) {
+              // PASSED: Reveal correct answer key
+              return `<div class="quiz-review-item ${isCorrect ? 'ok' : 'bad'}">
+                        ${svgIcon(isCorrect ? "check" : "quiz")}
+                        <div>
+                          <strong>Q${i + 1}.</strong> ${q.q}<br>
+                          <span style="color:var(--text-muted); font-size:13px;">Your answer: <strong>${chosenChoice}</strong></span><br>
+                          <span style="color:var(--accent); font-weight:600; font-size:13px;">✓ Correct answer: ${q.choices[q.answer]}</span>
+                        </div>
+                      </div>`;
+            } else {
+              // FAILED: Do NOT reveal correct answer key!
+              return `<div class="quiz-review-item ${isCorrect ? 'ok' : 'bad'}">
+                        ${svgIcon(isCorrect ? "check" : "quiz")}
+                        <div>
+                          <strong>Q${i + 1}.</strong> ${q.q}<br>
+                          <span style="color:${isCorrect ? 'var(--accent)' : 'var(--danger)'}; font-size:13px; font-weight:600;">
+                            ${isCorrect ? '✓ Correct' : '✗ Incorrect'} (Your answer: ${chosenChoice})
+                          </span>
+                          ${!isCorrect ? `<div style="color:var(--text-faint); font-size:12px; margin-top:3px;">🔒 Correct answer is hidden until you pass.</div>` : ''}
+                        </div>
+                      </div>`;
+            }
+          }).join("")}
         </div>
 
         <div style="display:flex; gap:10px; justify-content:center; margin-top:26px;">
           <a href="#/subject/${quiz.subjectId}" class="btn btn-outline">Back to Subject</a>
-          <button class="btn btn-primary" data-action="retry-quiz" data-id="${quiz.id}">Retry Quiz</button>
+          ${canRetry ? `<button class="btn btn-primary" data-action="retry-quiz" data-id="${quiz.id}">Retry Quiz (${attemptsLeft} left)</button>` : ''}
         </div>
       </div>
     </div>
@@ -3143,6 +3700,9 @@ function teacherModuleCardHTML(mod, subject) {
           <button class="btn btn-outline btn-sm" data-action="open-quiz" data-id="${mod.quizId}">Preview Quiz</button>
           <button class="btn btn-secondary btn-sm" data-action="open-module" data-id="${mod.id}">View Module</button>
           <button class="btn btn-outline btn-sm" data-action="open-modal-module" data-id="${mod.id}">Edit</button>
+          <button class="btn btn-outline btn-sm" data-action="reset-module-reading" data-id="${mod.id}" title="Reset reading progress to Page 0">📖 Reset Reading</button>
+          <button class="btn btn-outline btn-sm" data-action="reset-module-quiz" data-id="${mod.id}" title="Reset quiz scores and attempts to 0 (3 attempts available)">📝 Reset Quiz</button>
+          <button class="btn btn-warning btn-sm" data-action="reset-module-class-progress" data-id="${mod.id}" title="Reset both reading and quiz to 0%">⚡ Reset Full (0%)</button>
           ${isCustom ? `<button class="btn btn-danger btn-sm" data-action="delete-module" data-id="${mod.id}" onclick="return confirm('Delete module \"${mod.title}\" and its quiz?')">Delete</button>` : ''}
         </div>
       </div>
@@ -3153,11 +3713,11 @@ function renderTeacherStudents() {
   return `
     <div class="section-heading"><h2>Students</h2></div>
     <div class="card table-card">
-      <table><thead><tr><th>Student</th><th>ID</th><th>Section</th><th>Avg. Score</th><th>Progress</th><th></th></tr></thead>
+      <table><thead><tr><th>Student</th><th>ID</th><th>Section</th><th>Avg. Score</th><th>Progress</th><th>Actions</th></tr></thead>
       <tbody>${SEED.teacherStudents.map(s => {
     const ls = liveStudentStats(s); return `
-        <tr><td>${s.name}</td><td class="num">${s.id}</td><td>${s.section}</td><td class="num">${ls.avgScore}%</td><td class="num">${ls.progress}%</td>
-        <td><button class="btn btn-outline btn-sm" data-action="view-student" data-id="${s.id}">View</button></td></tr>`;
+        <tr><td><strong>${s.name}</strong></td><td class="num">${s.id}</td><td>${s.section}</td><td class="num">${ls.avgScore}%</td><td class="num">${ls.progress}%</td>
+        <td><button class="btn btn-outline btn-sm" data-action="view-student" data-id="${s.id}">📊 View & Reset</button></td></tr>`;
   }).join("")}</tbody></table>
     </div>
   `;
@@ -3233,6 +3793,7 @@ function renderTeacherModuleMatrix(subjectId = "sci10") {
               <th>Section</th>
               ${modules.map(m => `<th>Mod ${m.number}: ${m.title.length > 20 ? m.title.substring(0, 20) + '…' : m.title}</th>`).join("")}
               <th>Overall Score</th>
+              <th>Action</th>
             </tr>
           </thead>
           <tbody>
@@ -3253,6 +3814,7 @@ function renderTeacherModuleMatrix(subjectId = "sci10") {
       return `<td>${badge}</td>`;
     }).join("")}
                   <td class="num"><strong>${liveStudentStats(s).avgScore}%</strong></td>
+                  <td><button class="btn btn-outline btn-sm" data-action="view-student" data-id="${s.id}">🔄 Reset</button></td>
                 </tr>
               `;
   }).join("")}

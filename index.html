@@ -692,6 +692,43 @@
     </div>
   </div>
 
+  <!-- Modal 6: Student Progress & Reset Details (Teacher) -->
+  <div id="modal-student-detail" class="modal-overlay" hidden>
+    <div class="modal-card modal-card-lg">
+      <div class="modal-header">
+        <div>
+          <h3 id="student-detail-name">Student Details</h3>
+          <p id="student-detail-info">Section, scores, and module completion status.</p>
+        </div>
+        <button type="button" class="ghost-icon-btn modal-close-btn" data-action="close-modals">
+          <svg viewBox="0 0 24 24">
+            <path d="M18 6L6 18M6 6l12 12" />
+          </svg>
+        </button>
+      </div>
+      <div class="modal-form">
+        <div class="table-responsive" style="max-height: 380px; overflow-y: auto;">
+          <table>
+            <thead>
+              <tr>
+                <th>Module</th>
+                <th>Status / Score</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody id="student-detail-modules-tbody"></tbody>
+          </table>
+        </div>
+        <div class="modal-footer" style="margin-top: 16px; display: flex; justify-content: space-between; align-items: center;">
+          <button type="button" id="student-detail-reset-all-btn" class="btn btn-danger btn-sm" data-action="reset-student-all-modules">
+            🔄 Reset All Modules for this Student
+          </button>
+          <button type="button" class="btn btn-outline" data-action="close-modals">Close</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <script src="js/supabase-client.js"></script>
   <script src="js/data.js"></script>
