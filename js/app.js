@@ -1,4 +1,4 @@
-﻿/* =========================================================
+/* =========================================================
    EDUBOOK LMS — APPLICATION LOGIC
    Vanilla JS. State lives in localStorage under "edubook_db".
    Routing is hash-based (#/dashboard, #/subject/ict10, ...).
@@ -49,6 +49,8 @@ function seedIfNeeded() {
   if (!DB.customSubjects) DB.customSubjects = {};
   if (!DB.customModules) DB.customModules = {};
   if (!DB.customQuizzes) DB.customQuizzes = {};
+  if (!DB.cachedUsers) DB.cachedUsers = {};
+  Object.assign(SEED.users, DB.cachedUsers);
   if (DB.customSubjects.ttl && !DB.customSubjects.ttl.coverImage) {
     DB.customSubjects.ttl.coverImage = "assets/ttl_cover.png";
   }
@@ -269,6 +271,11 @@ async function attemptLogin(email, password, remember) {
   if (remember) localStorage.setItem(SESSION_KEY, email);
   else sessionStorage.setItem(SESSION_KEY, email);
 
+  // Cache user object locally
+  DB.cachedUsers = DB.cachedUsers || {};
+  DB.cachedUsers[email] = acct;
+  persist();
+
   // Pull this user's cloud progress ONLY if this device has no local copy yet
   // (brand-new device/browser). If local progress already exists here, it stays
   // authoritative — a stale/older cloud snapshot (e.g. from a push that hadn't
@@ -283,6 +290,7 @@ async function attemptLogin(email, password, remember) {
 function doLogout() {
   sessionStorage.removeItem(SESSION_KEY);
   localStorage.removeItem(SESSION_KEY);
+  if (typeof signOutSupabase === "function") signOutSupabase();
   location.hash = "";
   showLoginScreen();
 }
@@ -411,6 +419,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         const idx = SEED.teacherStudents.findIndex(s => s.id === row.id);
         if (idx >= 0) SEED.teacherStudents[idx] = mapped;
         else SEED.teacherStudents.push(mapped);
+        refreshActiveStudentModal(row.id);
       }
       route();
       if (typeof toast === "function") toast("Na-update ang student roster — may bagong laman.", "info");
@@ -464,25 +473,24 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
 
   // Check if session returned from Google OAuth redirect.
-  // Only run this Supabase call when there is evidence of an OAuth
-  // callback in the URL (access_token / code fragment or error).  This
-  // avoids a 3-second network round-trip on every normal page load for
-  // users who signed in with email/password.
   const _oauthParams = window.location.hash + window.location.search;
   const _isOAuthCallback = _oauthParams.includes("access_token") ||
     _oauthParams.includes("#error=") ||
     _oauthParams.includes("code=") ||
     _oauthParams.includes("type=recovery");
+
+  let googleUser = null;
   if (_isOAuthCallback && typeof checkAuthSessionSupabase === "function") {
-    const googleUser = await checkAuthSessionSupabase();
+    googleUser = await checkAuthSessionSupabase();
     if (googleUser) {
-      if (!SEED.users[googleUser.email]) {
-        SEED.users[googleUser.email] = googleUser;
-        if (typeof createUserSupabase === "function") {
-          createUserSupabase(googleUser);
-        }
-      }
-      if (!SEED.teacherStudents.find(s => s.email === googleUser.email)) {
+      SEED.users[googleUser.email] = googleUser;
+      DB.cachedUsers = DB.cachedUsers || {};
+      DB.cachedUsers[googleUser.email] = googleUser;
+
+      const tsIdx = SEED.teacherStudents.findIndex(s => s.email === googleUser.email);
+      if (tsIdx >= 0) {
+        SEED.teacherStudents[tsIdx] = { ...SEED.teacherStudents[tsIdx], name: googleUser.name, section: googleUser.section };
+      } else {
         SEED.teacherStudents.push({
           id: googleUser.id,
           name: googleUser.name,
@@ -493,33 +501,97 @@ document.addEventListener("DOMContentLoaded", async () => {
           moduleProgress: {}
         });
       }
+
+      localStorage.setItem(SESSION_KEY, googleUser.email);
       sessionStorage.setItem(SESSION_KEY, googleUser.email);
-      // Same "local wins" guard as the regular login path above.
+
       if (typeof fetchUserStateSupabase === "function" && !DB.perUser[googleUser.email]) {
         const cloudState = await fetchUserStateSupabase(googleUser.email);
-        if (cloudState) { DB.perUser[googleUser.email] = cloudState; persist(); }
+        if (cloudState) { DB.perUser[googleUser.email] = cloudState; }
       }
+      persist();
+
+      // Clean the OAuth token hash from URL
+      if (window.history && window.history.replaceState) {
+        window.history.replaceState(null, document.title, window.location.pathname);
+      }
+
       showAppScreen();
-      wireUserStateRealtime(googleUser.email);
-      location.hash = "#/dashboard";
+
+      if (googleUser.role === "teacher" || googleUser.role === "admin") {
+        if (typeof fetchAllUserStatesSupabase === "function") {
+          const allStates = await fetchAllUserStatesSupabase();
+          if (allStates) {
+            Object.keys(allStates).forEach(e => { DB.perUser[e] = allStates[e]; });
+            persist();
+          }
+        }
+        if (typeof subscribeAllUserStatesSupabase === "function") {
+          subscribeAllUserStatesSupabase((e, remoteState) => {
+            if (JSON.stringify(remoteState) === JSON.stringify(DB.perUser[e])) return;
+            DB.perUser[e] = remoteState;
+            localStorage.setItem(DB_KEY, JSON.stringify(DB));
+            refreshActiveStudentModal(e);
+            route();
+          });
+        }
+      } else {
+        wireUserStateRealtime(googleUser.email);
+      }
+
+      location.hash = googleUser.role === "teacher" ? "#/t-dashboard" : googleUser.role === "admin" ? "#/a-dashboard" : "#/dashboard";
       route();
       toast(`Welcome, ${googleUser.firstName}! 🎉`, "success");
       return;
     }
   }
 
-  const user = currentUser();
+  let user = currentUser();
+
+  // If user is null, check if Supabase has an active authenticated session
+  if (!user && typeof checkAuthSessionSupabase === "function") {
+    const sbUser = await checkAuthSessionSupabase();
+    if (sbUser) {
+      SEED.users[sbUser.email] = sbUser;
+      DB.cachedUsers = DB.cachedUsers || {};
+      DB.cachedUsers[sbUser.email] = sbUser;
+      localStorage.setItem(SESSION_KEY, sbUser.email);
+      sessionStorage.setItem(SESSION_KEY, sbUser.email);
+      user = sbUser;
+    }
+  }
+
   if (user) {
-    // Already-logged-in session (remembered device) — only pull cloud progress
-    // if this device somehow has no local copy yet. Local always wins once it
-    // exists, so a page refresh can never wipe out progress made moments ago
-    // that hasn't finished syncing to Supabase (800ms debounce + network lag).
-    if (typeof fetchUserStateSupabase === "function" && !DB.perUser[user.email]) {
-      const cloudState = await fetchUserStateSupabase(user.email);
-      if (cloudState) { DB.perUser[user.email] = cloudState; persist(); }
+    // If teacher or administrator: fetch all student user_state records so assignments,
+    // grades, and detailed student progress are populated on any device in real-time.
+    if (user.role === "teacher" || user.role === "admin") {
+      if (typeof fetchAllUserStatesSupabase === "function") {
+        const allStates = await fetchAllUserStatesSupabase();
+        if (allStates) {
+          Object.keys(allStates).forEach(e => {
+            DB.perUser[e] = allStates[e];
+          });
+          persist();
+        }
+      }
+      if (typeof subscribeAllUserStatesSupabase === "function") {
+        subscribeAllUserStatesSupabase((e, remoteState) => {
+          if (JSON.stringify(remoteState) === JSON.stringify(DB.perUser[e])) return;
+          DB.perUser[e] = remoteState;
+          localStorage.setItem(DB_KEY, JSON.stringify(DB));
+          refreshActiveStudentModal(e);
+          route();
+        });
+      }
+    } else {
+      // Regular student: load personal cloud progress if missing
+      if (typeof fetchUserStateSupabase === "function" && !DB.perUser[user.email]) {
+        const cloudState = await fetchUserStateSupabase(user.email);
+        if (cloudState) { DB.perUser[user.email] = cloudState; persist(); }
+      }
+      wireUserStateRealtime(user.email);
     }
     showAppScreen();
-    wireUserStateRealtime(user.email);
     route();
   }
   else { showLoginScreen(); }
@@ -622,8 +694,29 @@ function wireLoginScreen() {
     }
     errBox.hidden = true;
     showAppScreen();
-    wireUserStateRealtime(email);
     const role = SEED.users[email].role;
+    if (role === "teacher" || role === "admin") {
+      if (typeof fetchAllUserStatesSupabase === "function") {
+        fetchAllUserStatesSupabase().then(allStates => {
+          if (allStates) {
+            Object.keys(allStates).forEach(e => { DB.perUser[e] = allStates[e]; });
+            persist();
+            route();
+          }
+        });
+      }
+      if (typeof subscribeAllUserStatesSupabase === "function") {
+        subscribeAllUserStatesSupabase((e, remoteState) => {
+          if (JSON.stringify(remoteState) === JSON.stringify(DB.perUser[e])) return;
+          DB.perUser[e] = remoteState;
+          localStorage.setItem(DB_KEY, JSON.stringify(DB));
+          refreshActiveStudentModal(e);
+          route();
+        });
+      }
+    } else {
+      wireUserStateRealtime(email);
+    }
     location.hash = role === "teacher" ? "#/t-dashboard" : role === "admin" ? "#/a-dashboard" : "#/dashboard";
     route();
   });
@@ -660,8 +753,11 @@ function wireLoginScreen() {
         subjects: Object.keys(allSubjects())
       };
 
-      // Add to local catalog
+      // Add to local catalog & cache
       SEED.users[email] = newStudent;
+      DB.cachedUsers = DB.cachedUsers || {};
+      DB.cachedUsers[email] = newStudent;
+
       SEED.teacherStudents.push({
         id: newStudent.id,
         name: newStudent.name,
@@ -679,12 +775,14 @@ function wireLoginScreen() {
 
       // Log in session
       localStorage.setItem(SESSION_KEY, email);
+      sessionStorage.setItem(SESSION_KEY, email);
       userData(); // Initialize perUser state
       persist();
 
       if (submitBtn) submitBtn.disabled = false;
       errBox.hidden = true;
       showAppScreen();
+      wireUserStateRealtime(email);
       location.hash = "#/dashboard";
       route();
       toast(`Account created! Welcome to EduBook, ${newStudent.firstName}! 🎉`, "success");
@@ -1798,6 +1896,9 @@ function saveAssignmentScore(assignmentId, scoreInputEl) {
   if (!ud || !ud.submissions || !ud.submissions[assignmentId]) { toast("Submission not found", "error"); return; }
 
   ud.submissions[assignmentId].score = score;
+  if (typeof pushUserStateSupabaseImmediate === "function") {
+    pushUserStateSupabaseImmediate(studentEmail, ud);
+  }
   persist();
   toast("Score saved!", "success");
   route();
@@ -1811,6 +1912,9 @@ function returnAssignment(studentEmail, assignmentId) {
   if (!confirm("Return this submission? Student will need to resubmit.")) return;
 
   delete ud.submissions[assignmentId];
+  if (typeof pushUserStateSupabaseImmediate === "function") {
+    pushUserStateSupabaseImmediate(studentEmail, ud);
+  }
   persist();
   toast("Submission returned. Student can now resubmit.", "success");
   route();
@@ -1887,6 +1991,17 @@ function deleteUser(userId) {
 /* =========================================================
    STUDENT DETAIL & PROGRESS RESET (TEACHER POV)
 ========================================================= */
+function refreshActiveStudentModal(identifier) {
+  const modal = document.getElementById("modal-student-detail");
+  if (!modal || modal.hidden) return;
+  const nameEl = document.getElementById("student-detail-name");
+  if (!nameEl) return;
+  const student = SEED.teacherStudents.find(s => s.id === identifier || s.email === identifier);
+  if (student && nameEl.textContent.includes(student.name)) {
+    openStudentDetailModal(student.id);
+  }
+}
+
 function openStudentDetailModal(studentId) {
   const modal = document.getElementById("modal-student-detail");
   if (!modal) return;

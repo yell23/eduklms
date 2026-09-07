@@ -14,12 +14,13 @@ ibang file na nag-a-assume na naka-configure na ito.
 
 ## 1. Gumawa ng Supabase project
 
-1. Pumunta sa [supabase.com](https://supabase.com) → New Project.
-2. Sa **SQL Editor**, i-run ito nang sunod-sunod (paste tapos Run):
-   - `supabase-schema.sql` (gumagawa ng mga tables)
-   - `seed-data.sql` (nilalagyan ng laman — subjects/modules/quizzes/users galing sa data.js)
-   - `rls-policies.sql` (security rules + yung `verify_login` function)
-3. Sa **Settings → API**, kunin ang:
+1. Pumunta sa [supabase.com](https://supabase.com) → New Project (o buksan ang existing project).
+2. Sa **SQL Editor**, i-run ang updated:
+   - `rls-policies.sql` (Inaayos ang Google sign-in support, permissions, `sync_user_profile`, at multi-device Realtime replication)
+3. Sa **Authentication → Providers** (sa Supabase dashboard):
+   - I-enable ang **Google** provider kung gagamitin ang Google Sign-In (ilagay ang Google Client ID at Client Secret galing sa Google Cloud Console).
+   - Sa **URL Configuration**, idagdag ang site URL mo sa **Redirect URLs** (hal. `https://yoursite.netlify.app` o `http://localhost:5500` / `http://127.0.0.1:5500`).
+4. Sa **Settings → API**, kunin ang:
    - **Project URL**
    - **anon public key**
 

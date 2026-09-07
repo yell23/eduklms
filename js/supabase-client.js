@@ -167,7 +167,7 @@ async function pushUserStateSupabaseImmediate(email, stateObj) {
 ========================================================= */
 function _userToRow(u) {
   return {
-    email: u.email, password: u.password, role: u.role, user_id: u.id,
+    email: u.email, password: u.password || "", role: u.role || "student", user_id: u.id,
     name: u.name, first_name: u.firstName, grade: u.grade || null,
     section: u.section || null, department: u.department || null,
     title: u.title || null, subjects: u.subjects || []
@@ -191,39 +191,54 @@ async function signInWithGoogleSupabase() {
   }
 }
 
-async function checkAuthSessionSupabase() {
-  const sb = getClient();
-  if (!sb) return null;
-  try {
-    const { data, error } = await withTimeout(sb.auth.getSession(), 3000);
-    if (error || !data || !data.session || !data.session.user) return null;
-    const u = data.session.user;
-    const email = u.email;
-    const fullName = u.user_metadata?.full_name || u.user_metadata?.name || email.split("@")[0];
-    const firstName = fullName.split(" ")[0];
-    return {
-      email,
-      name: fullName,
-      firstName,
-      role: "student",
-      id: `STU-${Date.now().toString().slice(-6)}`,
-      grade: "Grade 10",
-      section: "Einstein",
-      subjects: ["ttl"]
-    };
-  } catch (e) {
-    return null;
-  }
-}
-
-async function createUserSupabase(userObj) {
+async function signOutSupabase() {
   const sb = getClient();
   if (!sb) return;
   try {
-    const { error } = await sb.from("users").insert(_userToRow(userObj));
-    if (error) console.warn("Supabase: failed to create user", error);
+    await sb.auth.signOut();
+  } catch (e) {
+    console.warn("Supabase signOut error:", e.message);
+  }
+}
 
-    // If student, also enroll in teacher_students catalog table
+async function syncUserProfileSupabase(userObj) {
+  const sb = getClient();
+  if (!sb) return userObj;
+  try {
+    const { data, error } = await sb.rpc("sync_user_profile", {
+      p_email: userObj.email,
+      p_password: userObj.password || "",
+      p_role: userObj.role || "student",
+      p_user_id: userObj.id || null,
+      p_name: userObj.name || "",
+      p_first_name: userObj.firstName || "",
+      p_grade: userObj.grade || null,
+      p_section: userObj.section || null,
+      p_department: userObj.department || null,
+      p_title: userObj.title || null,
+      p_subjects: userObj.subjects || []
+    });
+    if (!error && data) {
+      return {
+        ...userObj,
+        id: data.id || userObj.id,
+        role: data.role || userObj.role,
+        name: data.name || userObj.name,
+        firstName: data.firstName || userObj.firstName,
+        grade: data.grade || userObj.grade,
+        section: data.section || userObj.section,
+        department: data.department || userObj.department,
+        title: data.title || userObj.title,
+        subjects: data.subjects || userObj.subjects
+      };
+    }
+  } catch (e) {
+    console.warn("sync_user_profile RPC error, falling back to direct upsert:", e.message);
+  }
+
+  // Fallback: direct upsert into users & teacher_students
+  try {
+    await sb.from("users").upsert(_userToRow(userObj));
     if (userObj.role === "student") {
       await sb.from("teacher_students").upsert({
         id: userObj.id || `STU-${Date.now().toString().slice(-6)}`,
@@ -235,7 +250,56 @@ async function createUserSupabase(userObj) {
         module_progress: {}
       });
     }
-  } catch (e) { console.warn("Supabase: failed to create user", e.message); }
+  } catch (e) {
+    console.warn("Direct user upsert fallback error:", e.message);
+  }
+  return userObj;
+}
+
+async function checkAuthSessionSupabase() {
+  const sb = getClient();
+  if (!sb) return null;
+  try {
+    const { data, error } = await withTimeout(sb.auth.getSession(), 3000);
+    if (error || !data || !data.session || !data.session.user) return null;
+    const u = data.session.user;
+    const email = u.email;
+    const fullName = u.user_metadata?.full_name || u.user_metadata?.name || email.split("@")[0];
+    const firstName = fullName.split(" ")[0];
+
+    // Check if there is already an existing student or user record
+    let existingId = null;
+    let existingRole = "student";
+    let existingGrade = "Grade 10";
+    let existingSection = "Einstein";
+    try {
+      const { data: tsData } = await sb.from("teacher_students").select("*").eq("email", email).maybeSingle();
+      if (tsData) {
+        existingId = tsData.id;
+        if (tsData.section) existingSection = tsData.section;
+      }
+    } catch (_) {}
+
+    const baseUser = {
+      email,
+      name: fullName,
+      firstName,
+      role: existingRole,
+      id: existingId || `STU-${Date.now().toString().slice(-6)}`,
+      grade: existingGrade,
+      section: existingSection,
+      subjects: ["ttl"]
+    };
+
+    const synced = await syncUserProfileSupabase(baseUser);
+    return synced || baseUser;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function createUserSupabase(userObj) {
+  return await syncUserProfileSupabase(userObj);
 }
 
 async function updateUserSupabase(email, userObj) {
@@ -291,9 +355,10 @@ function pushTeacherStudentStatsSupabase(id, statsObj) {
   clearTimeout(_studentStatsPushTimer);
   _studentStatsPushTimer = setTimeout(async () => {
     try {
-      await sb.from("teacher_students").update({
+      const { error } = await sb.from("teacher_students").update({
         avg_score: statsObj.avgScore, progress: statsObj.progress, module_progress: statsObj.moduleProgress
       }).eq("id", id);
+      if (error) console.warn("Supabase: failed to update student stats", error.message);
     } catch (e) { console.warn("Background student-stats sync to Supabase failed:", e.message); }
   }, 800);
 }
@@ -303,9 +368,10 @@ async function pushTeacherStudentStatsSupabaseImmediate(id, statsObj) {
   if (!sb) return;
   clearTimeout(_studentStatsPushTimer);
   try {
-    await sb.from("teacher_students").update({
+    const { error } = await sb.from("teacher_students").update({
       avg_score: statsObj.avgScore, progress: statsObj.progress, module_progress: statsObj.moduleProgress
     }).eq("id", id);
+    if (error) console.warn("Supabase: immediate student stats update failed", error.message);
   } catch (e) {
     console.warn("Immediate student-stats sync failed:", e.message);
   }
@@ -575,4 +641,56 @@ function subscribeUserStateSupabase(email, onRemoteChange) {
     .subscribe();
 
   return _userStateChannel;
+}
+
+/* For teachers and administrators: fetch ALL student user_state rows at boot
+   so assignment submissions, quiz results, detailed module page progress,
+   and grades are populated on any device the teacher is using. */
+async function fetchAllUserStatesSupabase() {
+  const sb = getClient();
+  if (!sb) return null;
+  try {
+    const { data, error } = await withTimeout(sb.from("user_state").select("email, data"), 5000);
+    if (error || !data) return null;
+    const result = {};
+    data.forEach(row => {
+      if (row.email && row.data) {
+        result[row.email] = row.data;
+      }
+    });
+    return result;
+  } catch (e) {
+    console.warn("Failed to fetch all user states from Supabase:", e.message);
+    return null;
+  }
+}
+
+/* For teachers and administrators: subscribe to ANY user_state changes across
+   all students so submissions, quiz scores, and reading progress update
+   in real time without requiring manual page reloads. */
+let _allUserStatesChannel = null;
+function subscribeAllUserStatesSupabase(onRemoteChange) {
+  const sb = getClient();
+  if (!sb) return null;
+  if (_allUserStatesChannel) return _allUserStatesChannel;
+
+  _allUserStatesChannel = sb
+    .channel("all_user_state_changes")
+    .on(
+      "postgres_changes",
+      { event: "*", schema: "public", table: "user_state" },
+      (payload) => {
+        const row = payload.new;
+        if (row && row.email && row.data) {
+          onRemoteChange(row.email, row.data);
+        }
+      }
+    )
+    .subscribe((status) => {
+      if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+        console.warn("Realtime: all user_state subscription failed (" + status + ")");
+      }
+    });
+
+  return _allUserStatesChannel;
 }

@@ -8,7 +8,7 @@
 
 create table if not exists users (
   email        text primary key,
-  password     text not null,          -- plaintext demo-only login, see README note
+  password     text default '',        -- plaintext demo-only login, optional for OAuth/Google logins
   role         text not null,          -- 'student' | 'teacher' | 'admin'
   user_id      text,
   name         text,
