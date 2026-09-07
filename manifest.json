@@ -1,0 +1,14 @@
+{
+  "name": "EduBook LMS — An Offline-Ready Learning Management System",
+  "short_name": "EduBook LMS",
+  "description": "A prototype learning management system with a digital booklet module reader, built to work with limited or no internet connection.",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#F2F4FC",
+  "theme_color": "#4338CA",
+  "orientation": "any",
+  "icons": [
+    { "src": "assets/icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "assets/icons/icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}

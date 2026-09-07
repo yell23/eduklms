@@ -1,0 +1,8 @@
+-- USERS ONLY (the 3 essential login accounts). No subjects, modules, quizzes,
+-- assignments, announcements, or teacher_students rows are seeded — those
+-- tables stay empty so the app starts with a clean slate and only whatever
+-- the teacher/admin creates in-app (or you insert yourself) shows up.
+INSERT INTO users (email, password, role, user_id, name, first_name, grade, section, department, title, subjects) VALUES ('student@edubook.test', 'student123', 'student', 'STU-2025-0142', 'Juan Dela Cruz', 'Juan', 'Grade 10', 'Einstein', NULL, NULL, '[]'::jsonb) ON CONFLICT (email) DO NOTHING;
+INSERT INTO users (email, password, role, user_id, name, first_name, grade, section, department, title, subjects) VALUES ('teacher@edubook.test', 'teacher123', 'teacher', 'TCH-2019-0031', 'Maria Santos', 'Maria', NULL, NULL, 'Science & Technology', NULL, '[]'::jsonb) ON CONFLICT (email) DO NOTHING;
+INSERT INTO users (email, password, role, user_id, name, first_name, grade, section, department, title, subjects) VALUES ('admin@edubook.test', 'admin123', 'admin', 'ADM-0007', 'Ramon Aquino', 'Ramon', NULL, NULL, NULL, 'System Administrator', '[]'::jsonb) ON CONFLICT (email) DO NOTHING;
+INSERT INTO teacher_students (id, name, section, avg_score, progress, email, module_progress) VALUES ('STU-2025-0142', 'Juan Dela Cruz', 'Einstein', 0, 0, 'student@edubook.test', '{}'::jsonb) ON CONFLICT (id) DO NOTHING;
