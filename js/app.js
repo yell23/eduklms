@@ -4,7 +4,7 @@
    Routing is hash-based (#/dashboard, #/subject/ict10, ...).
 ========================================================= */
 
-console.log("EduBook app.js build: quiz-double-advance-fix-2 (stopPropagation)");
+console.log("EduBook app.js build: catalog-self-heal-1 (subject moduleIds repair)");
 
 const DB_KEY = "edubook_db";
 const SESSION_KEY = "edubook_session";
@@ -153,6 +153,10 @@ let _catalogDirty = false;
 // that save user-visible content (module/subject editor) must check this so
 // they never show a "Saved!" toast for content that only lives in memory.
 function persist() {
+  // Never save/push an orphaned catalog: rebuild subject.moduleIds from each
+  // module's own subjectId first. Skip while seed/reset wants the raw data.
+  if (!_suppressCatalogPush) repairSubjectModuleLinks();
+
   // Snapshot the shared catalog before saving. Only push it when it actually
   // changed: persist() is called for lots of things unrelated to the catalog
   // (progress, quiz answers, settings), and every push triggers a Realtime
@@ -183,6 +187,12 @@ function persist() {
   if (catalogChanged && typeof isSupabaseConfigured === "function" && !isSupabaseConfigured()) {
     // Pure-local mode (no Supabase configured): nothing to push, so treat it
     // as clean immediately instead of leaving a permanently "dirty" catalog.
+    _lastPushedCatalogJSON = catalogJSON;
+    _catalogDirty = false;
+  } else if (catalogChanged && !canPushCatalog()) {
+    // Only teachers/admins may write the shared catalog. A student device
+    // must never push its (possibly stale) copy over the teacher's content —
+    // that was the other half of why modules could vanish after a refresh.
     _lastPushedCatalogJSON = catalogJSON;
     _catalogDirty = false;
   } else if (catalogChanged) {
@@ -280,8 +290,120 @@ function applyRemoteCatalog(remoteData, remoteUpdatedAt, opts = {}) {
   return true;
 }
 
+function catalogJSONOfDB() {
+  return JSON.stringify({
+    customSubjects: DB.customSubjects || {},
+    customModules: DB.customModules || {},
+    customQuizzes: DB.customQuizzes || {}
+  });
+}
+
+function canPushCatalog() {
+  const u = typeof currentUser === "function" ? currentUser() : null;
+  return !!u && (u.role === "admin" || u.role === "teacher");
+}
+
+/* =========================================================
+   CATALOG INTEGRITY REPAIR
+   A subject's moduleIds is the ONLY thing that makes its modules
+   render. If an older/stale tab pushes a full catalog snapshot where
+   the module exists in customModules but the subject's moduleIds is
+   empty, the module "disappears" on the next refresh even though it
+   was saved. This rebuilds those links from each module's own
+   subjectId, so the catalog is self-healing.
+========================================================= */
+function repairSubjectModuleLinks() {
+  if (!DB) return false;
+  DB.customSubjects = DB.customSubjects || {};
+  DB.customModules = DB.customModules || {};
+
+  const subjects = allSubjects();
+  const modules = allModules();
+  let changed = false;
+
+  const originalLists = {};
+  Object.keys(subjects).forEach((sid) => {
+    const subject = subjects[sid];
+    originalLists[sid] = subject && Array.isArray(subject.moduleIds) ? subject.moduleIds.slice() : null;
+  });
+
+  // 1) Normalize: must be an array, no duplicates, no IDs for deleted modules.
+  Object.keys(subjects).forEach((sid) => {
+    const subject = subjects[sid];
+    if (!subject || typeof subject !== "object") return;
+    const original = Array.isArray(subject.moduleIds) ? subject.moduleIds : [];
+    const cleaned = [];
+    original.forEach((mid) => {
+      if (modules[mid] && !cleaned.includes(mid)) cleaned.push(mid);
+    });
+    if (!Array.isArray(subject.moduleIds) || cleaned.length !== original.length) {
+      subject.moduleIds = cleaned;
+      changed = true;
+    }
+  });
+
+  // 2) Every custom module must be listed under its own subject.
+  Object.keys(DB.customModules).forEach((mid) => {
+    const mod = DB.customModules[mid];
+    if (!mod || !mod.subjectId) return;
+    const subject = subjects[mod.subjectId];
+    if (!subject) return;
+    if (!Array.isArray(subject.moduleIds)) subject.moduleIds = [];
+    if (!subject.moduleIds.includes(mid)) {
+      subject.moduleIds.push(mid);
+      changed = true;
+    }
+  });
+
+  // 3) Save the repaired lists. Custom subjects were mutated in place; SEED
+  //    subjects need a custom override so the links survive a refresh.
+  Object.keys(subjects).forEach((sid) => {
+    const subject = subjects[sid];
+    if (!subject) return;
+    const list = Array.isArray(subject.moduleIds) ? subject.moduleIds : [];
+    const before = originalLists[sid] || [];
+    if (JSON.stringify(before) === JSON.stringify(list)) return;
+    changed = true;
+    if (DB.customSubjects[sid]) {
+      DB.customSubjects[sid].moduleIds = list;
+    } else {
+      DB.customSubjects[sid] = { ...subject, moduleIds: list };
+    }
+  });
+
+  if (changed) {
+    try { localStorage.setItem(DB_KEY, JSON.stringify(DB)); }
+    catch (e) { console.warn("Could not save repaired module links:", e.message); }
+  }
+  return changed;
+}
+
+// Applies a remote snapshot, then repairs any orphaned module links in it.
+// Teachers/admins mark the repaired catalog dirty so it gets pushed back and
+// stops the cloud copy from re-orphaning modules on every load.
+function applyRemoteCatalogAndRepair(remoteData, remoteUpdatedAt, opts = {}) {
+  const changed = applyRemoteCatalog(remoteData, remoteUpdatedAt, opts);
+  if (!repairSubjectModuleLinks()) return changed;
+
+  const remoteTs = Date.parse(remoteUpdatedAt || "") || 0;
+  if (canPushCatalog()) {
+    _catalogDirty = true;
+    DB._catalogUpdatedAt = Math.max(Number(DB._catalogUpdatedAt) || 0, remoteTs, Date.now());
+    try { localStorage.setItem(DB_KEY, JSON.stringify(DB)); } catch (e) { }
+  } else {
+    // Students must not push catalog snapshots. Treat the repaired copy as
+    // the local baseline so ordinary progress saves don't trigger a push.
+    _lastPushedCatalogJSON = catalogJSONOfDB();
+    _catalogDirty = false;
+  }
+  return true;
+}
+
 async function pushLocalCatalogNow() {
   if (typeof pushSharedStateSupabaseImmediate !== "function") return { ok: false, reason: "unavailable" };
+  // Never push an orphaned catalog: rebuild subject.moduleIds first so every
+  // save/push is self-consistent.
+  repairSubjectModuleLinks();
   const snapshot = {
     customSubjects: DB.customSubjects || {},
     customModules: DB.customModules || {},
@@ -301,18 +423,17 @@ async function syncCatalogFromCloud(force = false) {
   if (typeof fetchSharedStateSupabase !== "function") return false;
   const shared = await fetchSharedStateSupabase();
   if (!shared) return false;
-  const changed = applyRemoteCatalog(shared.data, shared.updatedAt, { force });
+  const changed = applyRemoteCatalogAndRepair(shared.data, shared.updatedAt, { force });
   if (changed) {
     route();
     if (typeof toast === "function") toast("Na-update ang content — may bagong laman.", "info");
-    return true;
   }
-  // Local edits are still unsynced (e.g. made while offline) — push them now
-  // that we're back online instead of letting the change sit unsynced.
-  if (_catalogDirty) {
+  // Local edits/repairs are still unsynced (e.g. made while offline) — push
+  // them now that we're back online. Students never push catalog snapshots.
+  if (_catalogDirty && canPushCatalog()) {
     await pushLocalCatalogNow();
   }
-  return false;
+  return changed;
 }
 
 /* =========================================================
@@ -350,6 +471,17 @@ function maybeMigrateInlineFiles() {
   if (!u || (u.role !== "admin" && u.role !== "teacher")) return;
   _inlineMigrationStarted = true;
   migrateInlineDataUrlsToStorage().catch((e) => console.warn("Inline file migration skipped:", e.message));
+}
+
+let _postLoginCatalogSynced = false;
+// Runs once after a fresh login (the boot-time sync already covers remembered
+// sessions). This is what repairs/pushes the catalog when the teacher was on
+// the login screen during DOMContentLoaded.
+function maybeSyncCatalogAfterLogin() {
+  if (_postLoginCatalogSynced) return;
+  if (!canPushCatalog()) return;
+  _postLoginCatalogSynced = true;
+  syncCatalogFromCloud().catch((e) => console.warn("Post-login catalog sync skipped:", e.message));
 }
 
 async function migrateInlineDataUrlsToStorage() {
@@ -562,6 +694,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
 
   seedIfNeeded();
+  // Heal any orphaned module links already in localStorage (e.g. the tab was
+  // closed before a repair push completed) before the first render, so modules
+  // stay visible even when the device is offline.
+  repairSubjectModuleLinks();
 
   // Sync the shared catalog (subjects/modules/quizzes) with Supabase. The
   // cloud copy is authoritative when it is newer; genuinely newer local
@@ -572,13 +708,23 @@ document.addEventListener("DOMContentLoaded", async () => {
   if (typeof fetchSharedStateSupabase === "function") {
     const shared = await fetchSharedStateSupabase();
     if (shared) {
-      const applied = applyRemoteCatalog(shared.data, shared.updatedAt);
       const remoteTs = Date.parse(shared.updatedAt || "") || 0;
-      if (!applied && (_catalogDirty || (Number(DB._catalogUpdatedAt) || 0) > remoteTs)) {
+      const applied = applyRemoteCatalogAndRepair(shared.data, shared.updatedAt);
+      // A genuinely newer local catalog (e.g. saved while offline) still needs
+      // to be pushed back. Content that is equal but happens to have an older
+      // server timestamp is treated as clean by repair/apply above.
+      if (!applied && (Number(DB._catalogUpdatedAt) || 0) > remoteTs) {
+        _catalogDirty = true;
+      }
+      if (_catalogDirty && canPushCatalog()) {
         await pushLocalCatalogNow();
       }
     }
   }
+  // A remembered teacher/admin session was already synced above; a fresh
+  // login (or a role switch to teacher) will fire maybeSyncCatalogAfterLogin()
+  // from route() instead.
+  if (canPushCatalog()) _postLoginCatalogSynced = true;
 
   applyTheme(DB.theme || "light");
   wireNetworkListeners();
@@ -604,7 +750,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       // push will settle it; the next focus/online sync catches anything
       // genuinely newer.
       if (_catalogDirty) return;
-      const changed = applyRemoteCatalog(sharedData, sharedUpdatedAt, { force: true });
+      const changed = applyRemoteCatalogAndRepair(sharedData, sharedUpdatedAt, { force: true });
       if (changed) {
         route();
         if (typeof toast === "function") toast("Na-update ang content — may bagong laman.", "info");
@@ -1472,6 +1618,7 @@ function toast(msg, type = "info") {
 ========================================================= */
 function route() {
   maybeMigrateInlineFiles();
+  maybeSyncCatalogAfterLogin();
   closeAllPanels();
   const user = currentUser();
   if (!user) { showLoginScreen(); return; }
