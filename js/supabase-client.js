@@ -33,6 +33,50 @@ function withTimeout(promise, ms = 6000) {
   ]);
 }
 
+function isSupabaseConfigured() {
+  return !!getClient();
+}
+
+/* =========================================================
+   FILE UPLOADS (Supabase Storage, "materials" bucket)
+
+   Why this exists: uploaded PDFs / videos / images / PowerPoints used
+   to be base64-encoded straight into the shared_state JSON blob and
+   localStorage. A single 3 MB cover image already fills most of the
+   ~5 MB localStorage quota, so adding a module could make persist()
+   throw QuotaExceededError — the module looked "saved" in memory but
+   vanished on refresh. Files now live in Storage and only their public
+   URL is stored in the database (tiny, cache-friendly, visible to
+   students on any device).
+
+   The bucket and its RLS policies are created by storage-policies.sql.
+   ========================================================= */
+async function uploadMaterialSupabase(file, folder = "materials") {
+  const sb = getClient();
+  if (!sb) throw new Error("Supabase is not configured — cannot upload file.");
+  if (!file) throw new Error("No file selected.");
+
+  const safeName = String(file.name || "file")
+    .replace(/[^a-zA-Z0-9._-]/g, "_")
+    .slice(-120);
+  const unique = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const path = `${folder}/${unique}-${safeName}`;
+
+  const { error } = await withTimeout(
+    sb.storage.from("materials").upload(path, file, {
+      cacheControl: "31536000",
+      upsert: false,
+      contentType: file.type || undefined
+    }),
+    60000 // uploads can legitimately take longer than the 6s catalog timeout
+  );
+  if (error) throw new Error(error.message || "File upload failed.");
+
+  const { data } = sb.storage.from("materials").getPublicUrl(path);
+  if (!data || !data.publicUrl) throw new Error("Could not build a public URL for the uploaded file.");
+  return { url: data.publicUrl, path };
+}
+
 /* =========================================================
    CATALOG (subjects/modules/quizzes/assignments/announcements)
    Fetched once at boot. Returns null on any failure so app.js
@@ -549,21 +593,38 @@ async function fetchSharedStateSupabase() {
   const sb = getClient();
   if (!sb) return null;
   try {
-    const { data, error } = await withTimeout(sb.from("shared_state").select("data").eq("id", "global").maybeSingle());
+    const { data, error } = await withTimeout(
+      sb.from("shared_state").select("data, updated_at").eq("id", "global").maybeSingle()
+    );
     if (error || !data) return null;
-    return data.data;
+    // Return the timestamp too so app.js can decide whether the cloud copy
+    // is actually newer than this device's local copy (instead of blindly
+    // keeping stale local content forever).
+    return { data: data.data || {}, updatedAt: data.updated_at || null };
   } catch (e) { return null; }
 }
 
 let _sharedStatePushTimer = null;
-function pushSharedStateSupabase(stateObj) {
+// onDone(ok, serverUpdatedAt) is optional; app.js uses the server timestamp so
+// its local "last updated" matches the cloud and doesn't trigger redundant
+// re-pushes on every reload/visibility change.
+function pushSharedStateSupabase(stateObj, onDone) {
   const sb = getClient();
-  if (!sb) return;
+  if (!sb) { if (onDone) onDone(false, null); return; }
   clearTimeout(_sharedStatePushTimer);
   _sharedStatePushTimer = setTimeout(async () => {
     try {
-      await sb.from("shared_state").upsert({ id: "global", data: stateObj, updated_at: new Date().toISOString() });
-    } catch (e) { console.warn("Background sync to Supabase failed (will retry on next change):", e.message); }
+      const { data, error } = await sb
+        .from("shared_state")
+        .upsert({ id: "global", data: stateObj, updated_at: new Date().toISOString() })
+        .select("updated_at")
+        .maybeSingle();
+      if (error) throw error;
+      if (onDone) onDone(true, (data && data.updated_at) || null);
+    } catch (e) {
+      console.warn("Background sync to Supabase failed (will retry on next change):", e.message);
+      if (onDone) onDone(false, null);
+    }
   }, 800);
 }
 
@@ -572,12 +633,24 @@ function pushSharedStateSupabase(stateObj) {
 // risks losing the race against the user immediately refreshing the page.
 async function pushSharedStateSupabaseImmediate(stateObj) {
   const sb = getClient();
-  if (!sb) return;
+  if (!sb) return { ok: false, reason: "offline" };
   clearTimeout(_sharedStatePushTimer); // don't let a stale debounced push fire later and clobber this
   try {
-    await sb.from("shared_state").upsert({ id: "global", data: stateObj, updated_at: new Date().toISOString() });
+    const { data, error } = await withTimeout(
+      sb.from("shared_state")
+        .upsert({ id: "global", data: stateObj, updated_at: new Date().toISOString() })
+        .select("updated_at")
+        .maybeSingle(),
+      20000
+    );
+    if (error) {
+      console.warn("Immediate sync to Supabase failed:", error.message);
+      return { ok: false, reason: error.message || "error" };
+    }
+    return { ok: true, updatedAt: (data && data.updated_at) || null };
   } catch (e) {
     console.warn("Immediate sync to Supabase failed:", e.message);
+    return { ok: false, reason: e.message || "error" };
   }
 }
 
@@ -605,7 +678,7 @@ function subscribeSharedStateSupabase(onRemoteChange) {
       { event: "*", schema: "public", table: "shared_state", filter: "id=eq.global" },
       (payload) => {
         const row = payload.new;
-        if (row && row.data) onRemoteChange(row.data);
+        if (row && row.data) onRemoteChange(row.data, row.updated_at || null);
       }
     )
     .subscribe((status) => {

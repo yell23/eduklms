@@ -50,6 +50,19 @@ function seedIfNeeded() {
   if (!DB.customModules) DB.customModules = {};
   if (!DB.customQuizzes) DB.customQuizzes = {};
   if (!DB.cachedUsers) DB.cachedUsers = {};
+  let legacyCatalogDirty = false;
+  if (typeof DB._catalogUpdatedAt !== "number") {
+    // Legacy DB (created before this timestamp existed). If it already has
+    // teacher-created content, treat it as newer than the cloud so a module
+    // whose earlier push failed is not silently wiped on the first load
+    // after this update — it gets pushed instead.
+    const hasCatalog =
+      Object.keys(DB.customSubjects || {}).length ||
+      Object.keys(DB.customModules || {}).length ||
+      Object.keys(DB.customQuizzes || {}).length;
+    DB._catalogUpdatedAt = hasCatalog ? Date.now() : 0;
+    legacyCatalogDirty = !!hasCatalog;
+  }
   Object.assign(SEED.users, DB.cachedUsers);
   if (DB.customSubjects.ttl && !DB.customSubjects.ttl.coverImage) {
     DB.customSubjects.ttl.coverImage = "assets/ttl_cover.png";
@@ -75,7 +88,20 @@ function seedIfNeeded() {
       if (DB.perUser[email][key] === undefined) DB.perUser[email][key] = defaults[key];
     });
   });
-  persist();
+  // Don't let the boot-time load push a possibly-stale local catalog over a
+  // newer cloud copy before fetchSharedStateSupabase() has had a chance to
+  // decide which one is authoritative.
+  _suppressCatalogPush = true;
+  try { persist(); } finally { _suppressCatalogPush = false; }
+  // Baseline for change detection. Without this, the very first persist()
+  // after boot (e.g. a student's page turn) would look like a catalog change
+  // and push this device's (possibly stale) catalog over the cloud copy.
+  _lastPushedCatalogJSON = JSON.stringify({
+    customSubjects: DB.customSubjects || {},
+    customModules: DB.customModules || {},
+    customQuizzes: DB.customQuizzes || {}
+  });
+  if (legacyCatalogDirty) _catalogDirty = true;
 }
 
 function buildFreshDB() {
@@ -93,6 +119,7 @@ function buildFreshDB() {
   return {
     theme: "light",
     connection: "online",
+    _catalogUpdatedAt: 0,
     customSubjects: {},
     customModules: {},
     customQuizzes: {},
@@ -119,31 +146,65 @@ function allQuizzes() {
 
 let _lastPushedCatalogJSON = null;
 let _lastPushedStudentStatsJSON = null;
+let _suppressCatalogPush = false;
+let _catalogDirty = false;
 
+// Returns true when the data was actually written to localStorage. Callers
+// that save user-visible content (module/subject editor) must check this so
+// they never show a "Saved!" toast for content that only lives in memory.
 function persist() {
+  // Snapshot the shared catalog before saving. Only push it when it actually
+  // changed: persist() is called for lots of things unrelated to the catalog
+  // (progress, quiz answers, settings), and every push triggers a Realtime
+  // event that echoes back to this same tab.
+  let catalogSnapshot = null;
+  let catalogJSON = null;
+  let catalogChanged = false;
+  if (!_suppressCatalogPush && typeof pushSharedStateSupabase === "function") {
+    catalogSnapshot = {
+      customSubjects: DB.customSubjects, customModules: DB.customModules, customQuizzes: DB.customQuizzes
+    };
+    catalogJSON = JSON.stringify(catalogSnapshot);
+    catalogChanged = catalogJSON !== _lastPushedCatalogJSON;
+    if (catalogChanged) {
+      DB._catalogUpdatedAt = Date.now();
+      _catalogDirty = true;
+    }
+  }
+
   try {
     localStorage.setItem(DB_KEY, JSON.stringify(DB));
   } catch (e) {
     console.error('Persist FAILED — storage quota exceeded:', e);
-    toast("Save failed: Data too large for storage. Remove large video files.", "error");
-    return;
+    toast("Save FAILED: data is too large for browser storage. Please remove large files or use smaller uploads.", "error");
+    return false;
   }
-  // Best-effort background sync to Supabase — debounced, never blocks the UI,
-  // silently skipped when offline or not configured (see js/supabase-client.js).
-  // Only push the shared catalog when it actually changed: persist() is
-  // called for lots of things unrelated to the catalog (progress, quiz
-  // answers, settings), and every push triggers a Realtime event that
-  // echoes back to this same tab — pushing unchanged data just spams the
-  // "may bagong laman" toast for no reason.
-  if (typeof pushSharedStateSupabase === "function") {
-    const catalogSnapshot = {
-      customSubjects: DB.customSubjects, customModules: DB.customModules, customQuizzes: DB.customQuizzes
-    };
-    const catalogJSON = JSON.stringify(catalogSnapshot);
-    if (catalogJSON !== _lastPushedCatalogJSON) {
+
+  if (catalogChanged && typeof isSupabaseConfigured === "function" && !isSupabaseConfigured()) {
+    // Pure-local mode (no Supabase configured): nothing to push, so treat it
+    // as clean immediately instead of leaving a permanently "dirty" catalog.
+    _lastPushedCatalogJSON = catalogJSON;
+    _catalogDirty = false;
+  } else if (catalogChanged) {
+    // Mark clean only after the push actually succeeds. If it fails (offline,
+    // server error), _catalogDirty stays true so the online/visibility sync
+    // can retry instead of silently losing the change.
+    pushSharedStateSupabase(catalogSnapshot, (ok, serverUpdatedAt) => {
+      if (!ok) return;
+      const stillCurrentJSON = JSON.stringify({
+        customSubjects: DB.customSubjects || {},
+        customModules: DB.customModules || {},
+        customQuizzes: DB.customQuizzes || {}
+      });
+      if (stillCurrentJSON !== catalogJSON) return; // newer edits queued their own push
       _lastPushedCatalogJSON = catalogJSON;
-      pushSharedStateSupabase(catalogSnapshot);
-    }
+      _catalogDirty = false;
+      const serverTs = Date.parse(serverUpdatedAt || "") || 0;
+      if (serverTs) {
+        DB._catalogUpdatedAt = serverTs;
+        try { localStorage.setItem(DB_KEY, JSON.stringify(DB)); } catch (e) { }
+      }
+    });
   }
   if (typeof pushUserStateSupabase === "function") {
     const u = currentUser();
@@ -168,6 +229,177 @@ function persist() {
         pushTeacherStudentStatsSupabase(student.id, payload);
       }
     }
+  }
+  return true;
+}
+
+// Applies a full cloud catalog snapshot (subjects/modules/quizzes) locally.
+// Unlike the old "only add keys we don't have yet" merge, this replaces the
+// whole custom catalog so edits made by a teacher — especially a subject's
+// moduleIds, which is what links a module to a subject — actually reach
+// students and other devices. Returns true if anything changed.
+function applyRemoteCatalog(remoteData, remoteUpdatedAt, opts = {}) {
+  if (!remoteData) return false;
+  const incoming = {
+    customSubjects: remoteData.customSubjects || {},
+    customModules: remoteData.customModules || {},
+    customQuizzes: remoteData.customQuizzes || {}
+  };
+  const incomingJSON = JSON.stringify(incoming);
+  const localJSON = JSON.stringify({
+    customSubjects: DB.customSubjects || {},
+    customModules: DB.customModules || {},
+    customQuizzes: DB.customQuizzes || {}
+  });
+  const remoteTs = Date.parse(remoteUpdatedAt || "") || 0;
+  const localTs = Number(DB._catalogUpdatedAt) || 0;
+
+  // Local edits win only when they are genuinely newer than the cloud copy
+  // (e.g. a push failed because the device was offline). Otherwise the cloud
+  // copy is authoritative, so new/edited modules and moduleIds propagate.
+  if (!opts.force && localTs > remoteTs) return false;
+  if (incomingJSON === localJSON) {
+    if (remoteTs > localTs) DB._catalogUpdatedAt = remoteTs;
+    _lastPushedCatalogJSON = incomingJSON;
+    _catalogDirty = false;
+    return false;
+  }
+
+  DB.customSubjects = incoming.customSubjects;
+  DB.customModules = incoming.customModules;
+  DB.customQuizzes = incoming.customQuizzes;
+  // Never treat the server's own snapshot as "local changes to push back".
+  _lastPushedCatalogJSON = incomingJSON;
+  _catalogDirty = false;
+  DB._catalogUpdatedAt = Math.max(remoteTs, localTs);
+  try {
+    localStorage.setItem(DB_KEY, JSON.stringify(DB));
+  } catch (e) {
+    console.error("Could not cache the cloud catalog locally (storage full):", e);
+  }
+  return true;
+}
+
+async function pushLocalCatalogNow() {
+  if (typeof pushSharedStateSupabaseImmediate !== "function") return { ok: false, reason: "unavailable" };
+  const snapshot = {
+    customSubjects: DB.customSubjects || {},
+    customModules: DB.customModules || {},
+    customQuizzes: DB.customQuizzes || {}
+  };
+  const res = await pushSharedStateSupabaseImmediate(snapshot) || { ok: false, reason: "timeout" };
+  if (res.ok) {
+    _lastPushedCatalogJSON = JSON.stringify(snapshot);
+    _catalogDirty = false;
+    DB._catalogUpdatedAt = Date.parse(res.updatedAt || "") || Date.now();
+    try { localStorage.setItem(DB_KEY, JSON.stringify(DB)); } catch (e) { /* quota; catalog still pushed */ }
+  }
+  return res;
+}
+
+async function syncCatalogFromCloud(force = false) {
+  if (typeof fetchSharedStateSupabase !== "function") return false;
+  const shared = await fetchSharedStateSupabase();
+  if (!shared) return false;
+  const changed = applyRemoteCatalog(shared.data, shared.updatedAt, { force });
+  if (changed) {
+    route();
+    if (typeof toast === "function") toast("Na-update ang content — may bagong laman.", "info");
+    return true;
+  }
+  // Local edits are still unsynced (e.g. made while offline) — push them now
+  // that we're back online instead of letting the change sit unsynced.
+  if (_catalogDirty) {
+    await pushLocalCatalogNow();
+  }
+  return false;
+}
+
+/* =========================================================
+   LEGACY INLINE DATA-URL MIGRATION
+   Older versions stored uploaded files as base64 `data:` URLs inside
+   DB (subject/module covers, PDF/video pages, gallery images). That is
+   what pushed localStorage over its ~5 MB quota. On first boot after
+   this update, move those blobs into Supabase Storage and replace them
+   with small public URLs. Safe to run every boot: it does nothing once
+   no `data:` URLs remain.
+========================================================= */
+function dataUrlToBlob(dataUrl) {
+  const comma = dataUrl.indexOf(",");
+  const meta = comma >= 0 ? dataUrl.slice(0, comma) : "";
+  const isBase64 = /;base64/i.test(meta);
+  const mime = (meta.match(/^data:([^;,]+)/i) || [])[1] || "application/octet-stream";
+  const payload = comma >= 0 ? dataUrl.slice(comma + 1) : "";
+  if (!isBase64) {
+    return new Blob([decodeURIComponent(payload)], { type: mime });
+  }
+  const bin = atob(payload);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new Blob([bytes], { type: mime });
+}
+
+let _inlineMigrationStarted = false;
+
+// Only the content owner's device (teacher/admin) migrates inline blobs, to
+// avoid every student re-uploading the same multi-MB cover image. Students
+// get the small URL version as soon as the teacher's catalog syncs.
+function maybeMigrateInlineFiles() {
+  if (_inlineMigrationStarted) return;
+  const u = currentUser();
+  if (!u || (u.role !== "admin" && u.role !== "teacher")) return;
+  _inlineMigrationStarted = true;
+  migrateInlineDataUrlsToStorage().catch((e) => console.warn("Inline file migration skipped:", e.message));
+}
+
+async function migrateInlineDataUrlsToStorage() {
+  if (typeof uploadMaterialSupabase !== "function") return;
+  if (typeof isSupabaseConfigured === "function" && !isSupabaseConfigured()) return;
+
+  let changed = false;
+  let seq = 0;
+
+  const migrateValue = async (getValue, setValue, folder) => {
+    const value = getValue();
+    if (typeof value !== "string" || !value.startsWith("data:")) return;
+    try {
+      const blob = dataUrlToBlob(value);
+      if (!blob.size) return;
+      const ext = (blob.type.split("/")[1] || "bin").replace(/[^a-z0-9]/gi, "") || "bin";
+      seq += 1;
+      const file = new File([blob], `inline-${Date.now()}-${seq}.${ext}`, { type: blob.type });
+      const uploaded = await uploadMaterialSupabase(file, folder);
+      setValue(uploaded.url);
+      changed = true;
+    } catch (e) {
+      console.warn("Could not migrate inline file to Storage:", e.message);
+    }
+  };
+
+  for (const subject of Object.values(DB.customSubjects || {})) {
+    if (!subject) continue;
+    await migrateValue(() => subject.coverImage, (v) => { subject.coverImage = v; }, "covers");
+  }
+
+  for (const mod of Object.values(DB.customModules || {})) {
+    if (!mod) continue;
+    await migrateValue(() => mod.coverImage, (v) => { mod.coverImage = v; }, "covers");
+    for (const page of (mod.pages || [])) {
+      if (!page) continue;
+      await migrateValue(() => page.coverImage, (v) => { page.coverImage = v; }, "covers");
+      await migrateValue(() => page.pdfUrl, (v) => { page.pdfUrl = v; }, "pdf");
+      await migrateValue(() => page.videoUrl, (v) => { page.videoUrl = v; }, "videos");
+      for (const img of (page.images || [])) {
+        if (!img) continue;
+        await migrateValue(() => img.src, (v) => { img.src = v; }, "images");
+      }
+    }
+  }
+
+  if (changed) {
+    persist();
+    route();
+    toast("Na-migrate ang malalaking naka-embed na files sa cloud storage.", "info");
   }
 }
 
@@ -331,26 +563,20 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   seedIfNeeded();
 
-  // Merge any teacher/admin-created content that's been synced to Supabase
-  // from another device/browser. Local (this device's localStorage) wins on
-  // any key conflict — it's always at least as fresh as what's already in
-  // Supabase, since every local edit is written to localStorage synchronously
-  // while the Supabase push can lag behind (debounced, or in flight when the
-  // page reloads). Remote is only used to fill in keys this device doesn't
-  // have yet, so cross-device sync for genuinely new content still works.
+  // Sync the shared catalog (subjects/modules/quizzes) with Supabase. The
+  // cloud copy is authoritative when it is newer; genuinely newer local
+  // edits (e.g. a save made while offline) win and get pushed instead. This
+  // replaces the old "only fill in keys we don't have" merge, which meant a
+  // student that had already cached a subject never received its new
+  // moduleIds — so newly uploaded modules stayed invisible forever.
   if (typeof fetchSharedStateSupabase === "function") {
     const shared = await fetchSharedStateSupabase();
     if (shared) {
-      let changed = false;
-      ["customSubjects", "customModules", "customQuizzes"].forEach((key) => {
-        Object.keys(shared[key] || {}).forEach((id) => {
-          if (!(id in DB[key])) {
-            DB[key][id] = shared[key][id];
-            changed = true;
-          }
-        });
-      });
-      if (changed) persist();
+      const applied = applyRemoteCatalog(shared.data, shared.updatedAt);
+      const remoteTs = Date.parse(shared.updatedAt || "") || 0;
+      if (!applied && (_catalogDirty || (Number(DB._catalogUpdatedAt) || 0) > remoteTs)) {
+        await pushLocalCatalogNow();
+      }
     }
   }
 
@@ -360,23 +586,26 @@ document.addEventListener("DOMContentLoaded", async () => {
   wireAppShell();
   updateStatusPill();
 
+  // Catch content changes missed while this tab was closed/backgrounded or
+  // while the device was offline. Realtime handles the live case; these are
+  // the safety nets.
+  window.addEventListener("online", () => { syncCatalogFromCloud(); });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") syncCatalogFromCloud();
+  });
+
   // REALTIME: listen for subjects/modules/quizzes added or edited by anyone
-  // else (any device, any tab). No reload needed — merges straight into DB
-  // and re-renders whatever screen is currently open.
+  // else (any device, any tab). No reload needed — replaces the whole cloud
+  // snapshot so additions, edits, and deletions all propagate.
   if (typeof subscribeSharedStateSupabase === "function") {
-    subscribeSharedStateSupabase((sharedData) => {
-      let changed = false;
-      ["customSubjects", "customModules", "customQuizzes"].forEach((key) => {
-        if (sharedData[key] && JSON.stringify(sharedData[key]) !== JSON.stringify(DB[key])) {
-          Object.assign(DB[key], sharedData[key]);
-          changed = true;
-        }
-      });
+    subscribeSharedStateSupabase((sharedData, sharedUpdatedAt) => {
+      // Don't let a remote echo (possibly of an older in-flight push) wipe
+      // edits that haven't been confirmed by the server yet. The pending
+      // push will settle it; the next focus/online sync catches anything
+      // genuinely newer.
+      if (_catalogDirty) return;
+      const changed = applyRemoteCatalog(sharedData, sharedUpdatedAt, { force: true });
       if (changed) {
-        // Save locally WITHOUT re-pushing to Supabase (we just received this
-        // from Supabase — pushing it back would just be a harmless but
-        // pointless echo, so skip straight to localStorage here).
-        localStorage.setItem(DB_KEY, JSON.stringify(DB));
         route();
         if (typeof toast === "function") toast("Na-update ang content — may bagong laman.", "info");
       }
@@ -471,6 +700,12 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (typeof toast === "function") toast("Na-update ang announcements — may bagong laman.", "info");
     });
   }
+
+  // Fire-and-forget: shrink old base64 blobs in the background so they stop
+  // eating the localStorage quota. Runs only once the teacher/admin is
+  // logged in (route() also triggers it after login) and is a no-op when
+  // nothing needs migrating.
+  maybeMigrateInlineFiles();
 
   // Check if session returned from Google OAuth redirect.
   const _oauthParams = window.location.hash + window.location.search;
@@ -853,28 +1088,36 @@ function wireAppShell() {
   });
 
   const subjCoverFileInput = document.getElementById("subj-cover-file");
-  if (subjCoverFileInput) subjCoverFileInput.addEventListener("change", () => {
+  if (subjCoverFileInput) subjCoverFileInput.addEventListener("change", async () => {
     const f = subjCoverFileInput.files && subjCoverFileInput.files[0];
-    if (f) {
-      const reader = new FileReader();
-      reader.onload = () => {
-        document.getElementById("subj-cover").value = reader.result;
-        toast("Subject cover image loaded!", "success");
-      };
-      reader.readAsDataURL(f);
+    if (!f) return;
+    _activeUploads += 1;
+    try {
+      toast("Uploading subject cover...", "info");
+      const url = await resolveUploadedFileUrl(f, "covers");
+      document.getElementById("subj-cover").value = url;
+      toast("Subject cover image uploaded!", "success");
+    } catch (e) {
+      toast(e.message || "Cover upload failed.", "error");
+    } finally {
+      _activeUploads = Math.max(0, _activeUploads - 1);
     }
   });
 
   const modCoverFileInput = document.getElementById("mod-cover-file");
-  if (modCoverFileInput) modCoverFileInput.addEventListener("change", () => {
+  if (modCoverFileInput) modCoverFileInput.addEventListener("change", async () => {
     const f = modCoverFileInput.files && modCoverFileInput.files[0];
-    if (f) {
-      const reader = new FileReader();
-      reader.onload = () => {
-        document.getElementById("mod-cover").value = reader.result;
-        toast("Module cover image loaded!", "success");
-      };
-      reader.readAsDataURL(f);
+    if (!f) return;
+    _activeUploads += 1;
+    try {
+      toast("Uploading module cover...", "info");
+      const url = await resolveUploadedFileUrl(f, "covers");
+      document.getElementById("mod-cover").value = url;
+      toast("Module cover image uploaded!", "success");
+    } catch (e) {
+      toast(e.message || "Cover upload failed.", "error");
+    } finally {
+      _activeUploads = Math.max(0, _activeUploads - 1);
     }
   });
 
@@ -1228,6 +1471,7 @@ function toast(msg, type = "info") {
    ROUTER
 ========================================================= */
 function route() {
+  maybeMigrateInlineFiles();
   closeAllPanels();
   const user = currentUser();
   if (!user) { showLoginScreen(); return; }
@@ -3015,24 +3259,43 @@ function pageInnerHTML(p, mod) {
   }
   /* ---- Feature 4: New material types ---- */
   if (p.type === "presentation") {
-    const slideCount = p.slides.length;
-    return `<div class="page-eyebrow">${svgIcon("slides")} Presentation</div>
-      <div class="page-content">
-        <h2>${p.heading}</h2>
-        <div class="presentation-wrap" id="pres-wrap">
+    const slides = Array.isArray(p.slides) ? p.slides : [];
+    const slideCount = slides.length;
+    const pptUrl = (p.pptUrl || "").trim();
+    let fileHTML = "";
+    if (pptUrl) {
+      const isRemote = /^https?:\/\//i.test(pptUrl);
+      const viewerSrc = isRemote
+        ? `https://view.officeapps.live.com/op/embed.aspx?src=${encodeURIComponent(pptUrl)}`
+        : "";
+      fileHTML = `
+        ${viewerSrc ? `<iframe src="${viewerSrc}" title="${p.heading}" frameborder="0" allowfullscreen style="width:100%; aspect-ratio:16/9; border-radius:12px; border:1px solid var(--border); background:#fff;"></iframe>` : ""}
+        <p style="margin-top:10px; font-size:13px; color:var(--text-muted);">
+          <a href="${pptUrl}" target="_blank" rel="noopener" style="color:var(--primary);">Open / download the original presentation →</a>
+          ${viewerSrc ? "" : "<br>Inline preview is only available for files stored in cloud storage."}
+        </p>`;
+    }
+    const textSlidesHTML = slideCount
+      ? `<div class="presentation-wrap" id="pres-wrap" style="margin-top:${fileHTML ? "18px" : "0"};">
           <div class="presentation-slides" id="pres-slides">
-            ${p.slides.map((s, i) => `<div class="pres-slide ${i === 0 ? 'active' : ''}" data-slide="${i}"><div class="pres-slide-num">Slide ${i + 1} of ${slideCount}</div><p>${s}</p></div>`).join("")}
+            ${slides.map((s, i) => `<div class="pres-slide ${i === 0 ? 'active' : ''}" data-slide="${i}"><div class="pres-slide-num">Slide ${i + 1} of ${slideCount}</div><p>${s}</p></div>`).join("")}
           </div>
           <div class="pres-nav">
             <button class="btn btn-outline btn-sm" onclick="presNav(-1)">← Prev</button>
             <span class="pres-counter" id="pres-counter">1 / ${slideCount}</span>
             <button class="btn btn-outline btn-sm" onclick="presNav(1)">Next →</button>
           </div>
-        </div>
+        </div>`
+      : (fileHTML ? "" : `<p style="color:var(--text-muted);">No slides have been added to this presentation yet.</p>`);
+    return `<div class="page-eyebrow">${svgIcon("slides")} Presentation</div>
+      <div class="page-content">
+        <h2>${p.heading}</h2>
+        ${fileHTML}
+        ${textSlidesHTML}
       </div>`;
   }
   if (p.type === "video") {
-    const hasRealVideo = p.videoUrl && (p.videoUrl.startsWith("data:video") || p.videoUrl.endsWith(".mp4") || p.videoUrl.includes("blob:"));
+    const hasRealVideo = p.videoUrl && (p.videoUrl.startsWith("data:video") || p.videoUrl.includes("blob:") || /\.(mp4|webm|ogg|ogv|mov|m4v)(\?|#|$)/i.test(p.videoUrl));
     const isYouTube = p.videoUrl && (p.videoUrl.includes("youtube.com") || p.videoUrl.includes("youtu.be"));
     let playerHTML = "";
 
@@ -3630,7 +3893,7 @@ function renderProgressPage() {
     <div class="stat-grid" style="grid-template-columns:repeat(3,1fr);">
       ${ring(stats.overallProgress, "Overall Progress", "var(--primary)")}
       ${ring(stats.avg, "Quiz Performance", "var(--accent)")}
-      ${ring(Math.round((Object.keys(ud.progress).length / studentSubjects().reduce((n, s) => n + s.moduleIds.length, 0)) * 100), "Reading Activity", "var(--amber)")}
+      ${ring(Math.round((Object.keys(ud.progress).length / studentSubjects().reduce((n, s) => n + (s.moduleIds || []).length, 0)) * 100), "Reading Activity", "var(--amber)")}
     </div>
 
     <div class="section-heading"><h2>Progress by Subject</h2></div>
@@ -3875,7 +4138,7 @@ function renderTeacherDashboard() {
         <div class="card subject-card">
           <div class="subject-cover ${hasCover ? 'with-cover-img' : ''}" style="${coverBg}">${hasCover ? '' : s.initial}</div>
           <div class="subject-card-body">
-            <div class="subject-card-top"><div><h4>${s.name}</h4><p class="subject-teacher">${s.moduleIds.length} modules</p></div></div>
+            <div class="subject-card-top"><div><h4>${s.name}</h4><p class="subject-teacher">${(s.moduleIds || []).length} modules</p></div></div>
             <div style="margin-top:14px;"><button class="btn btn-secondary btn-sm btn-block" data-action="open-subject" data-id="${s.id}">Manage</button></div>
           </div>
         </div>`;
@@ -3909,7 +4172,7 @@ function renderTeacherSubjects() {
         <div class="card subject-card">
           <div class="subject-cover ${hasCover ? 'with-cover-img' : ''}" style="${coverBg}">${hasCover ? '' : s.initial}</div>
           <div class="subject-card-body">
-            <div class="subject-card-top"><div><h4>${s.name}</h4><p class="subject-teacher">${s.moduleIds.length} modules · ${s.teacher}</p></div></div>
+            <div class="subject-card-top"><div><h4>${s.name}</h4><p class="subject-teacher">${(s.moduleIds || []).length} modules · ${s.teacher}</p></div></div>
             <div style="margin-top:14px; display:flex; gap:8px;">
               <button class="btn btn-outline btn-sm btn-block" data-action="open-modal-module-new" data-subject-id="${s.id}">+ Add Module</button>
               <button class="btn btn-secondary btn-sm btn-block" data-action="open-subject" data-id="${s.id}">View Subject</button>
@@ -3990,7 +4253,7 @@ function renderTeacherStudents() {
 }
 
 function renderTeacherQuizzes() {
-  const quizIds = teacherSubjects().flatMap(s => s.moduleIds.map(mid => (allModules()[mid] || {}).quizId).filter(Boolean));
+  const quizIds = teacherSubjects().flatMap(s => (s.moduleIds || []).map(mid => (allModules()[mid] || {}).quizId).filter(Boolean));
   return `
     <div class="section-heading"><h2>Quizzes</h2><button class="btn btn-primary btn-sm" data-action="open-modal-module">+ Create Module / Quiz</button></div>
     <div class="card table-card">
@@ -4034,7 +4297,7 @@ function renderTeacherModuleMatrix(subjectId = "sci10") {
   const students = SEED.teacherStudents;
   const subject = allSubjects()[subjectId] || allSubjects()["sci10"] || Object.values(allSubjects())[0];
   if (!subject) return "";
-  const modules = subject.moduleIds.map(mid => allModules()[mid]).filter(Boolean);
+  const modules = (subject.moduleIds || []).map(mid => allModules()[mid]).filter(Boolean);
 
   return `
     <div class="matrix-card card">
@@ -4763,9 +5026,7 @@ async function forceCloudSyncSupabase() {
   toast("Synchronizing with Supabase...", "info");
   try {
     if (typeof pushSharedStateSupabaseImmediate === "function") {
-      await pushSharedStateSupabaseImmediate({
-        customSubjects: DB.customSubjects, customModules: DB.customModules, customQuizzes: DB.customQuizzes
-      });
+      await pushLocalCatalogNow();
     }
     if (typeof fetchCatalogFromSupabase === "function") {
       const catalog = await fetchCatalogFromSupabase();
@@ -4963,10 +5224,10 @@ function openModuleModal(moduleId = null, preselectedSubjectId = null) {
     document.getElementById("mod-mins").value = 15;
 
     const curSub = allSubjects()[select.value];
-    document.getElementById("mod-number").value = curSub ? (curSub.moduleIds.length + 1) : 1;
+    document.getElementById("mod-number").value = curSub ? ((curSub.moduleIds || []).length + 1) : 1;
     select.onchange = () => {
       const s = allSubjects()[select.value];
-      if (s) document.getElementById("mod-number").value = s.moduleIds.length + 1;
+      if (s) document.getElementById("mod-number").value = (s.moduleIds || []).length + 1;
     };
 
     builderPages = [];
@@ -5002,8 +5263,8 @@ function addPageItem(type, existingPage = null) {
       </div>
       <div class="file-upload-box">
         <label class="btn btn-outline btn-sm file-upload-btn">
-          📁 Choose File from Computer (.txt / .doc / .md)
-          <input type="file" accept=".txt,.md,.doc,.docx" style="display:none;" onchange="handleLocalFile(this, 'text')">
+          📁 Choose Text File from Computer (.txt / .md)
+          <input type="file" accept=".txt,.md" style="display:none;" onchange="handleLocalFile(this, 'text')">
         </label>
         <span class="file-upload-note">or type lesson content below:</span>
       </div>
@@ -5053,6 +5314,7 @@ function addPageItem(type, existingPage = null) {
       </label>
     `;
   } else if (type === "presentation") {
+    const existingPptUrl = existingPage?.pptUrl || "";
     fieldsHTML = `
       <div class="builder-item-header">
         <span class="pill pill-warning">📑 PowerPoint / Slide Deck</span>
@@ -5060,18 +5322,22 @@ function addPageItem(type, existingPage = null) {
       </div>
       <div class="file-upload-box">
         <label class="btn btn-outline btn-sm file-upload-btn" style="border-color:#D97F0A; color:#D97F0A;">
-          📁 Upload Slides File (.ppt / .pptx / .txt)
+          📁 Upload PowerPoint (.pptx / .ppt)
           <input type="file" accept=".ppt,.pptx,.txt" style="display:none;" onchange="handleLocalFile(this, 'ppt')">
         </label>
-        <span class="file-upload-note">or write slides manually:</span>
+        <span class="file-upload-note">The original deck opens in the PowerPoint viewer. (.txt = one slide per line)</span>
+      </div>
+      <input type="hidden" class="bp-ppt-url" value="${existingPptUrl}">
+      <div class="bp-ppt-status" style="font-size:13px; margin:6px 0 2px; color:var(--text-muted);">
+        ${existingPptUrl ? `✅ <a href="${existingPptUrl}" target="_blank" rel="noopener">Uploaded presentation</a>` : "No presentation file uploaded yet."}
       </div>
       <label class="field">
         <span>Presentation Title *</span>
         <input type="text" class="bp-heading" placeholder="e.g. Review Slides: Chapter Key Takeaways" value="${existingPage?.heading || ''}" required>
       </label>
       <label class="field">
-        <span>Slide Contents (Write 1 slide per line) *</span>
-        <textarea class="bp-slides" rows="5" placeholder="Slide 1: Introduction and Key Objectives&#10;Slide 2: Main Principles and Definitions&#10;Slide 3: Real-World Applications and Examples&#10;Slide 4: Chapter Summary" required>${(existingPage?.slides || []).join("\n")}</textarea>
+        <span>Or type slide text (one slide per line — optional if a file is uploaded)</span>
+        <textarea class="bp-slides" rows="5" placeholder="Slide 1: Introduction and Key Objectives&#10;Slide 2: Main Principles and Definitions&#10;Slide 3: Real-World Applications and Examples&#10;Slide 4: Chapter Summary">${(existingPage?.slides || []).join("\n")}</textarea>
       </label>
     `;
   } else if (type === "video") {
@@ -5211,81 +5477,139 @@ function addPageItem(type, existingPage = null) {
   list.appendChild(card);
 }
 
-function handleLocalFile(input, type) {
-  const file = input.files[0];
+const MAX_INLINE_FALLBACK_BYTES = 1.5 * 1024 * 1024; // only for offline/no-Supabase fallback
+let _activeUploads = 0; // block form submit until in-flight file uploads finish
+
+function readFileAsDataURL(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(new Error("Could not read that file."));
+    reader.readAsDataURL(file);
+  });
+}
+function readFileAsText(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(new Error("Could not read that file."));
+    reader.readAsText(file);
+  });
+}
+
+// Upload a file to Supabase Storage and return its public URL. Falls back to
+// an inline data URL ONLY when Supabase isn't configured/reachable, and only
+// for small files — never silently fill the ~5 MB localStorage quota.
+async function resolveUploadedFileUrl(file, folder) {
+  if (typeof uploadMaterialSupabase === "function" && typeof isSupabaseConfigured === "function" && isSupabaseConfigured()) {
+    try {
+      const uploaded = await uploadMaterialSupabase(file, folder);
+      return uploaded.url;
+    } catch (e) {
+      console.warn("Storage upload failed:", e.message);
+      if (file.size > MAX_INLINE_FALLBACK_BYTES) {
+        throw new Error(`"${file.name}" could not be uploaded to cloud storage (${e.message}). Please check your connection and try again.`);
+      }
+      toast("Cloud upload failed — storing a small copy locally.", "warning");
+    }
+  }
+  if (file.size > MAX_INLINE_FALLBACK_BYTES) {
+    throw new Error(`"${file.name}" is too large (${(file.size / 1048576).toFixed(1)} MB) to store locally. Connect to the internet so it can upload to cloud storage.`);
+  }
+  return await readFileAsDataURL(file);
+}
+
+async function handleLocalFile(input, type) {
+  const file = input.files && input.files[0];
   if (!file) return;
   const card = input.closest(".builder-item-card");
   if (!card) return;
 
-  const reader = new FileReader();
-
-  if (type === "pdf") {
-    const titleInput = card.querySelector(".bp-heading");
-    if (titleInput && (!titleInput.value || titleInput.value.includes("Reading Material"))) {
-      titleInput.value = file.name;
-    }
-    reader.onload = (e) => {
+  _activeUploads += 1;
+  try {
+    if (type === "pdf") {
+      const titleInput = card.querySelector(".bp-heading");
+      if (titleInput && (!titleInput.value || titleInput.value.includes("Reading Material"))) {
+        titleInput.value = file.name;
+      }
+      toast(`Uploading PDF "${file.name}"...`, "info");
+      const url = await resolveUploadedFileUrl(file, "pdf");
       const urlInput = card.querySelector(".bp-pdf-url");
       if (urlInput) {
-        urlInput.value = e.target.result;
+        urlInput.value = url;
         urlInput.dataset.fileName = file.name;
       }
-      toast(`PDF "${file.name}" loaded from your computer!`, "success");
-    };
-    reader.readAsDataURL(file);
-  }
-  else if (type === "video") {
-    const titleInput = card.querySelector(".bp-heading");
-    if (titleInput && (!titleInput.value || titleInput.value.includes("Video Lecture"))) {
-      titleInput.value = file.name.replace(/\.[^/.]+$/, "");
+      toast(`PDF "${file.name}" uploaded!`, "success");
     }
-    reader.onload = (e) => {
+    else if (type === "video") {
+      const titleInput = card.querySelector(".bp-heading");
+      if (titleInput && (!titleInput.value || titleInput.value.includes("Video Lecture"))) {
+        titleInput.value = file.name.replace(/\.[^/.]+$/, "");
+      }
+      toast(`Uploading video "${file.name}"...`, "info");
+      const url = await resolveUploadedFileUrl(file, "video");
       const urlInput = card.querySelector(".bp-video-url");
       if (urlInput) {
-        urlInput.value = e.target.result;
+        urlInput.value = url;
         urlInput.dataset.fileName = file.name;
       }
-      toast(`Video "${file.name}" loaded from your computer!`, "success");
-    };
-    reader.readAsDataURL(file);
-  }
-  else if (type === "image") {
-    const files = Array.from(input.files);
-    const textarea = card.querySelector(".bp-gallery");
-    const galleryItems = [];
-    let loadedCount = 0;
+      toast(`Video "${file.name}" uploaded!`, "success");
+    }
+    else if (type === "image") {
+      const files = Array.from(input.files);
+      const textarea = card.querySelector(".bp-gallery");
+      const galleryItems = [];
+      toast(`Uploading ${files.length} image(s)...`, "info");
+      for (const f of files) {
+        const url = await resolveUploadedFileUrl(f, "images");
+        galleryItems.push({ src: url, caption: f.name.replace(/\.[^/.]+$/, "") });
+      }
+      card.dataset.customImages = JSON.stringify(galleryItems);
+      if (textarea) textarea.value = files.map(f => `🖼️ | ${f.name.replace(/\.[^/.]+$/, "")}`).join("\n");
+      toast(`${files.length} image(s) uploaded!`, "success");
+    }
+    else if (type === "text") {
+      const text = await readFileAsText(file);
+      const bodyTextarea = card.querySelector(".bp-body");
+      if (bodyTextarea) bodyTextarea.value = text;
+      const titleInput = card.querySelector(".bp-heading");
+      if (titleInput && !titleInput.value) titleInput.value = file.name.replace(/\.[^/.]+$/, "");
+      toast(`File "${file.name}" loaded!`, "success");
+    }
+    else if (type === "ppt") {
+      const ext = (file.name.split(".").pop() || "").toLowerCase();
+      const titleInput = card.querySelector(".bp-heading");
+      if (titleInput && !titleInput.value) titleInput.value = file.name.replace(/\.[^/.]+$/, "");
 
-    files.forEach((f) => {
-      const imgReader = new FileReader();
-      imgReader.onload = (e) => {
-        galleryItems.push({ src: e.target.result, caption: f.name.replace(/\.[^/.]+$/, "") });
-        loadedCount++;
-        if (loadedCount === files.length) {
-          card.dataset.customImages = JSON.stringify(galleryItems);
-          if (textarea) textarea.value = files.map(f => `🖼️ | ${f.name.replace(/\.[^/.]+$/, "")}`).join("\n");
-          toast(`${files.length} image(s) loaded from your computer!`, "success");
-        }
-      };
-      imgReader.readAsDataURL(f);
-    });
-  }
-  else if (type === "text" || type === "ppt") {
-    reader.onload = (e) => {
-      const text = e.target.result;
-      if (type === "text") {
-        const bodyTextarea = card.querySelector(".bp-body");
-        if (bodyTextarea) bodyTextarea.value = text;
-        const titleInput = card.querySelector(".bp-heading");
-        if (titleInput && !titleInput.value) titleInput.value = file.name.replace(/\.[^/.]+$/, "");
-      } else {
+      if (ext === "txt") {
+        // Plain text is a legitimate way to author slides (one per line).
+        const text = await readFileAsText(file);
         const slidesTextarea = card.querySelector(".bp-slides");
         if (slidesTextarea) slidesTextarea.value = text;
-        const titleInput = card.querySelector(".bp-heading");
-        if (titleInput && !titleInput.value) titleInput.value = file.name.replace(/\.[^/.]+$/, "");
+        toast(`Slides text "${file.name}" loaded!`, "success");
+      } else if (ext === "ppt" || ext === "pptx") {
+        // Do NOT readAsText() a PPT/PPTX: they are binary (PPTX is a ZIP),
+        // which is exactly why uploaded decks used to come out as garbage.
+        // Store the original file and render it with the Office Online viewer.
+        toast(`Uploading presentation "${file.name}"...`, "info");
+        const url = await resolveUploadedFileUrl(file, "slides");
+        const pptInput = card.querySelector(".bp-ppt-url");
+        if (pptInput) pptInput.value = url;
+        card.dataset.pptUrl = url;
+        const status = card.querySelector(".bp-ppt-status");
+        if (status) {
+          status.innerHTML = `✅ <strong>${file.name}</strong> — <a href="${url}" target="_blank" rel="noopener">open / download</a>`;
+        }
+        toast(`Presentation "${file.name}" uploaded!`, "success");
+      } else {
+        toast("Please choose a .pptx, .ppt, or .txt file.", "error");
       }
-      toast(`File "${file.name}" loaded from your computer!`, "success");
-    };
-    reader.readAsText(file);
+    }
+  } catch (e) {
+    console.error("File upload error:", e);
+    toast(e.message || "File upload failed.", "error");
+  } finally {
+    _activeUploads = Math.max(0, _activeUploads - 1);
   }
 }
 
@@ -5404,6 +5728,10 @@ function toggleQTypeFields(selectEl, wrapId) {
 
 async function handleCreateSubjectSubmit(e) {
   e.preventDefault();
+  if (_activeUploads > 0) {
+    toast("Please wait for the file upload to finish, then save again.", "warning");
+    return;
+  }
   const name = document.getElementById("subj-name").value.trim();
   const code = document.getElementById("subj-code").value.trim().toLowerCase().replace(/[^a-z0-9]/g, "");
   const teacher = document.getElementById("subj-teacher").value.trim();
@@ -5429,7 +5757,8 @@ async function handleCreateSubjectSubmit(e) {
         coverImage: coverImage || existingSubject.coverImage || null,
         initial: (code.substring(0, 2) || name.substring(0, 2)).toUpperCase(),
         description: desc,
-        objectives
+        objectives,
+        moduleIds: existingSubject.moduleIds || []
       };
 
       DB.customSubjects = DB.customSubjects || {};
@@ -5451,7 +5780,6 @@ async function handleCreateSubjectSubmit(e) {
 
       DB.customSubjects[subjectId] = subject;
     }
-    toast(`Subject "${name}" successfully updated!`, "success");
   } else {
     // Create new subject
     const newSubject = {
@@ -5468,14 +5796,20 @@ async function handleCreateSubjectSubmit(e) {
 
     DB.customSubjects = DB.customSubjects || {};
     DB.customSubjects[subjectId] = newSubject;
-    toast(`Subject "${name}" successfully created!`, "success");
   }
 
-  persist();
-  if (typeof pushSharedStateSupabaseImmediate === "function") {
-    await pushSharedStateSupabaseImmediate({
-      customSubjects: DB.customSubjects, customModules: DB.customModules, customQuizzes: DB.customQuizzes
-    });
+  // Only report success once it actually reached localStorage. persist()
+  // shows its own error toast and returns false on quota failure.
+  if (!persist()) return;
+
+  let pushed = { ok: true };
+  if (typeof isSupabaseConfigured === "function" && isSupabaseConfigured()) {
+    pushed = await pushLocalCatalogNow();
+  }
+  if (pushed.ok) {
+    toast(isEditing ? `Subject "${name}" successfully updated!` : `Subject "${name}" successfully created!`, "success");
+  } else {
+    toast(`Subject saved on this device, but cloud sync failed (${pushed.reason}). Students may not see it yet.`, "warning");
   }
   closeAllModals();
   route();
@@ -5483,6 +5817,10 @@ async function handleCreateSubjectSubmit(e) {
 
 async function handleCreateModuleSubmit(e) {
   e.preventDefault();
+  if (_activeUploads > 0) {
+    toast("Please wait for the file upload to finish, then save again.", "warning");
+    return;
+  }
   const subjectId = document.getElementById("mod-subject").value;
   const num = parseInt(document.getElementById("mod-number").value, 10) || 1;
   const mins = parseInt(document.getElementById("mod-mins").value, 10) || 15;
@@ -5493,6 +5831,7 @@ async function handleCreateModuleSubmit(e) {
 
   const subject = allSubjects()[subjectId];
   if (!subject) { toast("Subject not found.", "danger"); return; }
+  if (!Array.isArray(subject.moduleIds)) subject.moduleIds = [];
 
   const isEditing = !!editingModuleId;
   const modId = editingModuleId || `m-${subjectId}-${num}-${Date.now().toString().slice(-4)}`;
@@ -5539,9 +5878,10 @@ async function handleCreateModuleSubmit(e) {
       pages.push({ type: "quiz-page", heading: heading || "Ready for the Quiz?", instructions, body: [bodyText || ""] });
       steps.push("Take Quiz");
     } else if (card.querySelector(".bp-slides")) {
+      const pptUrl = (card.querySelector(".bp-ppt-url")?.value || "").trim();
       const slides = slidesText.split("\n").map(s => s.trim()).filter(Boolean);
-      if (slides.length) {
-        pages.push({ type: "presentation", heading: heading || "Review Presentation Slides", slides });
+      if (slides.length || pptUrl) {
+        pages.push({ type: "presentation", heading: heading || "Review Presentation Slides", slides, pptUrl });
         steps.push("Review Slides");
       }
     } else if (card.querySelector(".bp-video-url") !== null) {
@@ -5669,13 +6009,21 @@ async function handleCreateModuleSubmit(e) {
         const oldSubject = allSubjects()[oldSubjectId];
         if (oldSubject && oldSubject.moduleIds) {
           oldSubject.moduleIds = oldSubject.moduleIds.filter(id => id !== editingModuleId);
-          if (DB.customSubjects && DB.customSubjects[oldSubjectId]) {
-            DB.customSubjects[oldSubjectId].moduleIds = oldSubject.moduleIds;
-          }
+          DB.customSubjects = DB.customSubjects || {};
+          DB.customSubjects[oldSubjectId] = { ...oldSubject, moduleIds: oldSubject.moduleIds };
         }
       }
+
+      // ALWAYS make sure the target subject points at this module. The old
+      // code only did this for brand-new modules, so moving an edited module
+      // to another subject (or editing one whose subject.moduleIds was empty)
+      // left it invisible to students in that subject.
+      if (!subject.moduleIds.includes(editingModuleId)) {
+        subject.moduleIds.push(editingModuleId);
+      }
+      DB.customSubjects = DB.customSubjects || {};
+      DB.customSubjects[subjectId] = { ...subject, moduleIds: subject.moduleIds };
     }
-    toast(`Module "${title}" successfully updated!`, "success");
   } else {
     // Create new module
     const newModule = {
@@ -5702,14 +6050,20 @@ async function handleCreateModuleSubmit(e) {
         DB.customSubjects[subjectId] = { ...subject };
       }
     }
-    toast(`Module "${title}" successfully published!`, "success");
   }
 
-  persist();
-  if (typeof pushSharedStateSupabaseImmediate === "function") {
-    await pushSharedStateSupabaseImmediate({
-      customSubjects: DB.customSubjects, customModules: DB.customModules, customQuizzes: DB.customQuizzes
-    });
+  // Only report success once it actually reached localStorage. persist()
+  // shows its own error toast and returns false on quota failure.
+  if (!persist()) return;
+
+  let pushed = { ok: true };
+  if (typeof isSupabaseConfigured === "function" && isSupabaseConfigured()) {
+    pushed = await pushLocalCatalogNow();
+  }
+  if (pushed.ok) {
+    toast(isEditing ? `Module "${title}" successfully updated!` : `Module "${title}" successfully published!`, "success");
+  } else {
+    toast(`Module saved on this device, but cloud sync failed (${pushed.reason}). Students may not see it yet.`, "warning");
   }
   closeAllModals();
   route();
