@@ -791,6 +791,13 @@
     </div>
   </div>
 
+  <!-- Full-screen image viewer for gallery images -->
+  <div id="image-lightbox" class="image-lightbox" hidden aria-hidden="true">
+    <div class="image-lightbox-backdrop" data-action="close-image"></div>
+    <img id="image-lightbox-img" class="image-lightbox-img" alt="">
+    <button type="button" class="image-lightbox-close" data-action="close-image" aria-label="Close image">✕</button>
+  </div>
+
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <script src="js/supabase-client.js"></script>
   <script src="js/data.js"></script>

@@ -11,6 +11,7 @@ const SESSION_KEY = "edubook_session";
 let DB = null;
 let quizState = null;   // transient in-progress quiz attempt
 let readerState = null; // transient booklet reader state
+const MAX_GALLERY_IMAGES = 4; // max images per gallery page
 
 /* ---------------- NAV ICON PATHS ---------------- */
 const NAV_ICONS = {
@@ -1721,6 +1722,8 @@ function handleViewClick(e) {
     "reader-download": () => downloadModule(readerState.moduleId, t),
     "reader-mark-complete": () => markModuleComplete(readerState.moduleId),
     "reader-start-quiz": () => { const m = allModules()[readerState.moduleId]; location.hash = `#/quiz/${m ? m.quizId : ''}`; },
+    "open-image": () => openImageLightbox(t.dataset.src, t.dataset.alt),
+    "close-image": () => closeImageLightbox(),
     "quiz-select": () => selectQuizAnswer(parseInt(t.dataset.idx, 10)),
     "quiz-prev": () => stepQuiz(-1),
     "quiz-next": () => stepQuiz(1),
@@ -1837,6 +1840,13 @@ function handleViewChange(e) {
 }
 
 function handleGlobalKeydown(e) {
+  const lightbox = document.getElementById("image-lightbox");
+  const lightboxOpen = !!(lightbox && !lightbox.hidden);
+  if (e.key === "Escape" && lightboxOpen) {
+    closeImageLightbox();
+    return;
+  }
+  if (lightboxOpen) return;
   if (!readerState) return;
   if (!location.hash.startsWith("#/module/")) return;
   if (e.key === "ArrowRight") turnPage(1);
@@ -3483,9 +3493,11 @@ function pageInnerHTML(p, mod) {
       <div class="page-content">
         <h2>${p.heading}</h2>
         <div class="image-gallery-grid">
-          ${p.images.map(img => `
+          ${p.images.slice(0, MAX_GALLERY_IMAGES).map(img => `
             <div class="gallery-img-card">
-              ${img.src ? `<img src="${img.src}" class="gallery-real-img" alt="${img.caption}" style="max-height:120px; width:100%; object-fit:contain; border-radius:8px;">` : `<div class="gallery-img-emoji">${img.emoji || '🖼️'}</div>`}
+              ${img.src
+                ? `<img src="${img.src}" class="gallery-real-img" alt="${img.caption || 'Gallery image'}" data-action="open-image" data-src="${img.src}" data-alt="${img.caption || 'Gallery image'}" title="Click to enlarge">`
+                : `<div class="gallery-img-emoji">${img.emoji || '🖼️'}</div>`}
               <div class="gallery-img-caption">${img.caption}</div>
             </div>`).join("")}
         </div>
@@ -3570,6 +3582,27 @@ function togglePdfViewer(viewerId, pdfUrl) {
     }
     viewer.dataset.loaded = "true";
   }
+}
+
+function openImageLightbox(src, alt) {
+  const box = document.getElementById("image-lightbox");
+  const img = document.getElementById("image-lightbox-img");
+  if (!box || !img || !src) return;
+  img.src = src;
+  img.alt = alt || "Gallery image";
+  box.hidden = false;
+  box.setAttribute("aria-hidden", "false");
+  document.body.classList.add("lightbox-open");
+}
+
+function closeImageLightbox() {
+  const box = document.getElementById("image-lightbox");
+  const img = document.getElementById("image-lightbox-img");
+  if (!box) return;
+  box.hidden = true;
+  box.setAttribute("aria-hidden", "true");
+  if (img) img.removeAttribute("src");
+  document.body.classList.remove("lightbox-open");
 }
 
 function turnPage(dir) {
@@ -5401,6 +5434,10 @@ function addPageItem(type, existingPage = null) {
   card.className = "builder-item-card";
   card.id = `builder-page-${pageIdx}`;
 
+  if (type === "image-gallery" && Array.isArray(existingPage?.images)) {
+    card.dataset.customImages = JSON.stringify(existingPage.images);
+  }
+
   let fieldsHTML = "";
   if (type === "lesson") {
     fieldsHTML = `
@@ -5521,18 +5558,19 @@ function addPageItem(type, existingPage = null) {
       </div>
       <div class="file-upload-box">
         <label class="btn btn-outline btn-sm file-upload-btn">
-          📁 Choose Images from Computer (Multi-select)
+          📁 Choose Images from Computer (Up to ${MAX_GALLERY_IMAGES} per page)
           <input type="file" accept="image/*" multiple style="display:none;" onchange="handleLocalFile(this, 'image')">
         </label>
-        <span class="file-upload-note">or list diagram captions:</span>
+        <span class="file-upload-note">Maximum of ${MAX_GALLERY_IMAGES} images per page · <strong class="bp-gallery-count">0/${MAX_GALLERY_IMAGES}</strong></span>
       </div>
+      <div class="bp-gallery-preview" aria-live="polite"></div>
       <label class="field">
         <span>Gallery Heading *</span>
         <input type="text" class="bp-heading" placeholder="e.g. Reference Diagrams & Illustrations" value="${existingPage?.heading || ''}" required>
       </label>
       <label class="field">
-        <span>Gallery Items (Write 1 item per line with format: Emoji | Caption) *</span>
-        <textarea class="bp-gallery" rows="4" placeholder="📊 | Chart: Regional Statistics&#10;🧬 | Diagram: Cellular Structure&#10;🔬 | Lab Apparatus Setup" required>${(existingPage?.images || []).map(i => `${i.emoji} | ${i.caption}`).join("\n")}</textarea>
+        <span>Gallery Items (Max ${MAX_GALLERY_IMAGES} — write 1 item per line: Emoji | Caption) *</span>
+        <textarea class="bp-gallery" rows="4" placeholder="📊 | Chart: Regional Statistics&#10;🧬 | Diagram: Cellular Structure&#10;🔬 | Lab Apparatus Setup" required>${(existingPage?.images || []).map(i => `${i.emoji || '🖼️'} | ${i.caption}`).join("\n")}</textarea>
       </label>
     `;
   } else if (type === "activity") {
@@ -5622,6 +5660,64 @@ function addPageItem(type, existingPage = null) {
 
   card.innerHTML = fieldsHTML;
   list.appendChild(card);
+
+  if (type === "image-gallery") renderGalleryPreview(card);
+}
+
+function renderGalleryPreview(card) {
+  if (!card) return;
+  let images = [];
+  try { images = JSON.parse(card.dataset.customImages || "[]"); } catch (e) { images = []; }
+  if (!Array.isArray(images)) images = [];
+  if (images.length > MAX_GALLERY_IMAGES) {
+    images = images.slice(0, MAX_GALLERY_IMAGES);
+    card.dataset.customImages = JSON.stringify(images);
+    const textarea = card.querySelector(".bp-gallery");
+    if (textarea) {
+      textarea.value = textarea.value
+        .split("\n")
+        .map(line => line.trim())
+        .filter(Boolean)
+        .slice(0, MAX_GALLERY_IMAGES)
+        .join("\n");
+    }
+  }
+
+  const counter = card.querySelector(".bp-gallery-count");
+  if (counter) counter.textContent = `${images.length}/${MAX_GALLERY_IMAGES}`;
+
+  const preview = card.querySelector(".bp-gallery-preview");
+  if (!preview) return;
+  preview.innerHTML = images.map((img, i) => {
+    const caption = String(img.caption || "Image").replace(/"/g, "&quot;");
+    return `<div class="bp-gallery-thumb" title="${caption}">
+      ${img.src
+        ? `<img src="${img.src}" alt="${caption}">`
+        : `<div class="bp-gallery-thumb-emoji">${img.emoji || '🖼️'}</div>`}
+      <button type="button" class="bp-gallery-remove" onclick="removeGalleryImage('${card.id}', ${i})" aria-label="Remove image">✕</button>
+    </div>`;
+  }).join("");
+}
+
+function removeGalleryImage(cardId, index) {
+  const card = document.getElementById(cardId);
+  if (!card) return;
+  let images = [];
+  try { images = JSON.parse(card.dataset.customImages || "[]"); } catch (e) { images = []; }
+  if (!Array.isArray(images) || index < 0 || index >= images.length) return;
+
+  images.splice(index, 1);
+  card.dataset.customImages = JSON.stringify(images);
+
+  const textarea = card.querySelector(".bp-gallery");
+  if (textarea) {
+    const lines = textarea.value.split("\n").map(line => line.trim()).filter(Boolean);
+    if (index < lines.length) lines.splice(index, 1);
+    textarea.value = lines.join("\n");
+  }
+
+  renderGalleryPreview(card);
+  toast("Image removed.", "info");
 }
 
 const MAX_INLINE_FALLBACK_BYTES = 1.5 * 1024 * 1024; // only for offline/no-Supabase fallback
@@ -5703,17 +5799,59 @@ async function handleLocalFile(input, type) {
       toast(`Video "${file.name}" uploaded!`, "success");
     }
     else if (type === "image") {
-      const files = Array.from(input.files);
+      const files = Array.from(input.files || []);
+      input.value = "";
+      if (!files.length) return;
+
       const textarea = card.querySelector(".bp-gallery");
+      let existingImages = [];
+      try { existingImages = JSON.parse(card.dataset.customImages || "[]"); } catch (e) { existingImages = []; }
+      if (!Array.isArray(existingImages)) existingImages = [];
+      existingImages = existingImages.slice(0, MAX_GALLERY_IMAGES);
+
+      if (!existingImages.length && textarea && textarea.value.trim()) {
+        existingImages = textarea.value
+          .split("\n")
+          .map(line => line.trim())
+          .filter(Boolean)
+          .slice(0, MAX_GALLERY_IMAGES)
+          .map(line => {
+            const parts = line.split("|").map(p => p.trim());
+            return { emoji: parts[0] || "🖼️", caption: parts[1] || parts[0] || "Illustration" };
+          });
+        card.dataset.customImages = JSON.stringify(existingImages);
+        renderGalleryPreview(card);
+      }
+
+      const remaining = MAX_GALLERY_IMAGES - existingImages.length;
+      if (remaining <= 0) {
+        toast(`Maximum of ${MAX_GALLERY_IMAGES} images per page. Remove one first.`, "error");
+        return;
+      }
+
+      const filesToUpload = files.slice(0, remaining);
+      if (files.length > remaining) {
+        toast(`Only ${remaining} more image(s) can be added — ${files.length - remaining} skipped.`, "warning");
+      }
+
       const galleryItems = [];
-      toast(`Uploading ${files.length} image(s)...`, "info");
-      for (const f of files) {
+      toast(`Uploading ${filesToUpload.length} image(s)...`, "info");
+      for (const f of filesToUpload) {
         const url = await resolveUploadedFileUrl(f, "images");
         galleryItems.push({ src: url, caption: f.name.replace(/\.[^/.]+$/, "") });
       }
-      card.dataset.customImages = JSON.stringify(galleryItems);
-      if (textarea) textarea.value = files.map(f => `🖼️ | ${f.name.replace(/\.[^/.]+$/, "")}`).join("\n");
-      toast(`${files.length} image(s) uploaded!`, "success");
+
+      card.dataset.customImages = JSON.stringify(existingImages.concat(galleryItems));
+      if (textarea) {
+        const oldLines = textarea.value.split("\n").map(l => l.trim()).filter(Boolean).slice(0, existingImages.length);
+        while (oldLines.length < existingImages.length) {
+          oldLines.push(`🖼️ | ${existingImages[oldLines.length].caption || "Image"}`);
+        }
+        const newLines = galleryItems.map(i => `🖼️ | ${i.caption}`);
+        textarea.value = oldLines.concat(newLines).join("\n");
+      }
+      renderGalleryPreview(card);
+      toast(`${galleryItems.length} image(s) uploaded!`, "success");
     }
     else if (type === "text") {
       const text = await readFileAsText(file);
@@ -6041,13 +6179,34 @@ async function handleCreateModuleSubmit(e) {
     } else if (customImagesJSON || card.querySelector(".bp-gallery")) {
       let items = [];
       if (customImagesJSON) {
-        try { items = JSON.parse(customImagesJSON); } catch (e) { }
+        try { items = JSON.parse(customImagesJSON) || []; } catch (e) { items = []; }
       }
-      if (!items.length && galleryText) {
-        items = galleryText.split("\n").map(line => {
-          const parts = line.split("|").map(p => p.trim());
-          return { emoji: parts[0] || "🖼️", caption: parts[1] || parts[0] || "Illustration" };
-        }).filter(Boolean);
+      if (!Array.isArray(items)) items = [];
+      const galleryLines = galleryText
+        ? galleryText.split("\n").map(line => line.trim()).filter(Boolean)
+        : [];
+      const parsedItems = galleryLines.map(line => {
+        const parts = line.split("|").map(p => p.trim());
+        return { emoji: parts[0] || "🖼️", caption: parts[1] || parts[0] || "Illustration" };
+      });
+      if (items.length) {
+        items = items.map((img, i) => {
+          const edited = parsedItems[i];
+          return {
+            ...img,
+            emoji: edited?.emoji || img.emoji || "🖼️",
+            caption: edited?.caption || img.caption || "Illustration"
+          };
+        });
+      } else {
+        items = parsedItems;
+      }
+      if (parsedItems.length > items.length) {
+        items = items.concat(parsedItems.slice(items.length));
+      }
+      if (items.length > MAX_GALLERY_IMAGES) {
+        items = items.slice(0, MAX_GALLERY_IMAGES);
+        toast(`Only the first ${MAX_GALLERY_IMAGES} images were saved for this gallery page.`, "warning");
       }
       pages.push({ type: "image-gallery", heading: heading || "Reference Gallery", images: items });
       steps.push("Explore Gallery");
