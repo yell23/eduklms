@@ -137,14 +137,17 @@ function buildFreshDB() {
 
 function allSubjects() {
   const custom = (DB && DB.customSubjects) || {};
+  if (DB && DB._relationalSynced) return custom;
   return { ...SEED.subjects, ...custom };
 }
 function allModules() {
   const custom = (DB && DB.customModules) || {};
+  if (DB && DB._relationalSynced) return custom;
   return { ...SEED.modules, ...custom };
 }
 function allQuizzes() {
   const custom = (DB && DB.customQuizzes) || {};
+  if (DB && DB._relationalSynced) return custom;
   return { ...SEED.quizzes, ...custom };
 }
 
@@ -358,20 +361,38 @@ function applyRelationalCatalog(catalog) {
   DB.customSubjects = DB.customSubjects || {};
   DB.customModules = DB.customModules || {};
   DB.customQuizzes = DB.customQuizzes || {};
-  const prev = DB._relationalIds || { subjects: [], modules: [], quizzes: [] };
   let changed = false;
 
-  const dropMissing = (store, prevIds, incoming) => {
-    (prevIds || []).forEach((id) => {
-      if (!incoming[id] && Object.prototype.hasOwnProperty.call(store, id)) {
+  // Drop any item from local store that does not exist in incoming cloud catalog
+  const dropMissing = (store, incoming, seedStore) => {
+    Object.keys(store || {}).forEach((id) => {
+      if (!incoming || !incoming[id]) {
         delete store[id];
+        if (seedStore && seedStore[id]) delete seedStore[id];
         changed = true;
       }
     });
   };
-  dropMissing(DB.customSubjects, prev.subjects, catalog.subjects || {});
-  dropMissing(DB.customModules, prev.modules, catalog.modules || {});
-  dropMissing(DB.customQuizzes, prev.quizzes, catalog.quizzes || {});
+  dropMissing(DB.customSubjects, catalog.subjects || {}, SEED.subjects);
+  dropMissing(DB.customModules, catalog.modules || {}, SEED.modules);
+  dropMissing(DB.customQuizzes, catalog.quizzes || {}, SEED.quizzes);
+
+  // If cloud catalog returned subjects/modules/quizzes, clean up SEED mirrors too
+  if (catalog.subjects) {
+    Object.keys(SEED.subjects || {}).forEach(id => {
+      if (!catalog.subjects[id]) delete SEED.subjects[id];
+    });
+  }
+  if (catalog.modules) {
+    Object.keys(SEED.modules || {}).forEach(id => {
+      if (!catalog.modules[id]) delete SEED.modules[id];
+    });
+  }
+  if (catalog.quizzes) {
+    Object.keys(SEED.quizzes || {}).forEach(id => {
+      if (!catalog.quizzes[id]) delete SEED.quizzes[id];
+    });
+  }
 
   const mergeRows = (store, incoming) => {
     Object.keys(incoming || {}).forEach((id) => {
@@ -386,6 +407,7 @@ function applyRelationalCatalog(catalog) {
   mergeRows(DB.customModules, catalog.modules);
   mergeRows(DB.customQuizzes, catalog.quizzes);
 
+  DB._relationalSynced = true;
   DB._relationalIds = {
     subjects: Object.keys(catalog.subjects || {}),
     modules: Object.keys(catalog.modules || {}),
@@ -518,14 +540,34 @@ function handleCatalogRealtimeChange(table, eventType, row) {
   };
 
   if (table === "subjects") {
-    if (eventType === "DELETE") removeLocal(DB.customSubjects, row.id);
-    else upsertLocal(DB.customSubjects, row.id, catalogRowToSubject(row));
+    if (eventType === "DELETE") {
+      removeLocal(DB.customSubjects, row.id);
+      if (SEED.subjects && SEED.subjects[row.id]) delete SEED.subjects[row.id];
+    } else {
+      upsertLocal(DB.customSubjects, row.id, catalogRowToSubject(row));
+    }
   } else if (table === "modules") {
-    if (eventType === "DELETE") removeLocal(DB.customModules, row.id);
-    else upsertLocal(DB.customModules, row.id, catalogRowToModule(row));
+    if (eventType === "DELETE") {
+      removeLocal(DB.customModules, row.id);
+      if (SEED.modules && SEED.modules[row.id]) delete SEED.modules[row.id];
+      Object.values(DB.perUser || {}).forEach(ud => {
+        if (ud.progress) delete ud.progress[row.id];
+        if (ud.quizResults) delete ud.quizResults[row.id];
+        if (ud.downloads) delete ud.downloads[row.id];
+        const bookmarkIdx = ud.bookmarksOrder?.indexOf(row.id);
+        if (bookmarkIdx > -1) ud.bookmarksOrder.splice(bookmarkIdx, 1);
+        ud.completedModules = (ud.completedModules || []).filter(m => m !== row.id);
+      });
+    } else {
+      upsertLocal(DB.customModules, row.id, catalogRowToModule(row));
+    }
   } else if (table === "quizzes") {
-    if (eventType === "DELETE") removeLocal(DB.customQuizzes, row.id);
-    else upsertLocal(DB.customQuizzes, row.id, catalogRowToQuiz(row));
+    if (eventType === "DELETE") {
+      removeLocal(DB.customQuizzes, row.id);
+      if (SEED.quizzes && SEED.quizzes[row.id]) delete SEED.quizzes[row.id];
+    } else {
+      upsertLocal(DB.customQuizzes, row.id, catalogRowToQuiz(row));
+    }
   }
 
   if (repairSubjectModuleLinks()) changed = true;
@@ -541,9 +583,9 @@ function handleCatalogRealtimeChange(table, eventType, row) {
 async function pushAllLocalCatalogToRelational() {
   if (typeof upsertSubjectSupabase !== "function") return;
   if (typeof isSupabaseConfigured === "function" && !isSupabaseConfigured()) return;
-  const subjects = allSubjects();
-  const modules = allModules();
-  const quizzes = allQuizzes();
+  const subjects = (DB && DB.customSubjects) || {};
+  const modules = (DB && DB.customModules) || {};
+  const quizzes = (DB && DB.customQuizzes) || {};
   for (const sid of Object.keys(subjects)) await upsertSubjectSupabase({ ...subjects[sid], id: sid });
   for (const mid of Object.keys(modules)) await upsertModuleSupabase({ ...modules[mid], id: mid });
   for (const qid of Object.keys(quizzes)) await upsertQuizSupabase({ ...quizzes[qid], id: qid });
@@ -570,18 +612,6 @@ async function pushLocalCatalogNow() {
 }
 
 async function syncCatalogFromCloud(force = false) {
-  // If the first boot happened offline, finish the one-time legacy import and
-  // relational migration as soon as connectivity returns.
-  if (!DB._catalogMigratedToTables && typeof migrateLocalCatalogToRelational === "function") {
-    if (typeof importLegacySharedCatalog === "function" && await importLegacySharedCatalog()) {
-      repairSubjectModuleLinks();
-    }
-    const migration = await migrateLocalCatalogToRelational();
-    if (migration && migration.ok) {
-      DB._catalogMigratedToTables = true;
-      try { localStorage.setItem(DB_KEY, JSON.stringify(DB)); } catch (e) { }
-    }
-  }
   // Catalog is read from the relational tables, never from the legacy
   // shared_state blob. This cannot overwrite or delete another device's rows.
   return refreshCatalogFromRelational();
@@ -834,19 +864,6 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Heal any orphaned module links already in localStorage before the first
   // render, so modules stay visible even when the device is offline.
   repairSubjectModuleLinks();
-
-  // First boot after this update: bring in any legacy shared_state content and
-  // copy every locally-known entity into the relational tables. Only IDs that
-  // don't exist in the cloud are inserted, so this can never overwrite a newer
-  // row created on another device.
-  if (!DB._catalogMigratedToTables && typeof fetchCatalogFromSupabase === "function") {
-    if (await importLegacySharedCatalog()) repairSubjectModuleLinks();
-    const migration = await migrateLocalCatalogToRelational();
-    if (migration && migration.ok) {
-      DB._catalogMigratedToTables = true;
-      try { localStorage.setItem(DB_KEY, JSON.stringify(DB)); } catch (e) { }
-    }
-  }
 
   // The relational tables (subjects/modules/quizzes) are the source of truth.
   // On any failure (offline / not configured) this keeps the local cache.
@@ -1994,6 +2011,7 @@ async function deleteSubject(subjectId) {
   }
 
   delete DB.customSubjects[subjectId];
+  if (SEED.subjects && SEED.subjects[subjectId]) delete SEED.subjects[subjectId];
 
   // Remove every module that belongs to this subject (moduleIds may be stale,
   // so also match by each module's own subjectId).
@@ -2002,11 +2020,17 @@ async function deleteSubject(subjectId) {
     const m = DB.customModules[mid];
     if (m && m.subjectId === subjectId) removedModuleIds.add(mid);
   });
-  removedModuleIds.forEach(mid => { delete DB.customModules[mid]; });
+  removedModuleIds.forEach(mid => {
+    delete DB.customModules[mid];
+    if (SEED.modules && SEED.modules[mid]) delete SEED.modules[mid];
+  });
   // Remove any quiz that belongs to one of this subject's modules.
   Object.keys(DB.customQuizzes || {}).forEach(qid => {
     const q = DB.customQuizzes[qid];
-    if (q && (q.subjectId === subjectId || removedModuleIds.has(q.moduleId))) delete DB.customQuizzes[qid];
+    if (q && (q.subjectId === subjectId || removedModuleIds.has(q.moduleId))) {
+      delete DB.customQuizzes[qid];
+      if (SEED.quizzes && SEED.quizzes[qid]) delete SEED.quizzes[qid];
+    }
   });
 
   Object.values(DB.perUser).forEach(ud => {
@@ -2023,6 +2047,7 @@ async function deleteSubject(subjectId) {
   persist();
   closeAllModals();
   route();
+  toast("Subject deleted.", "success");
 }
 
 function handleCreateAnnouncementSubmit(e) {
@@ -2329,7 +2354,11 @@ async function deleteModule(moduleId) {
   }
 
   delete DB.customModules[moduleId];
-  if (mod.quizId) delete DB.customQuizzes[mod.quizId];
+  if (SEED.modules && SEED.modules[moduleId]) delete SEED.modules[moduleId];
+  if (mod.quizId) {
+    delete DB.customQuizzes[mod.quizId];
+    if (SEED.quizzes && SEED.quizzes[mod.quizId]) delete SEED.quizzes[mod.quizId];
+  }
 
   if (subject && subject.moduleIds) {
     subject.moduleIds = subject.moduleIds.filter(id => id !== moduleId);
@@ -2347,6 +2376,7 @@ async function deleteModule(moduleId) {
   persist();
   closeAllModals();
   route();
+  toast("Module deleted.", "success");
 }
 
 function deleteAnnouncement(announcementId) {
