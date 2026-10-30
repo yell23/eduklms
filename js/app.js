@@ -54,6 +54,10 @@ function seedIfNeeded() {
     DB._relationalIds = { subjects: [], modules: [], quizzes: [] };
   }
   if (!DB.cachedUsers) DB.cachedUsers = {};
+  if (!DB.cachedAssignments) DB.cachedAssignments = null;
+  if (!DB.cachedAnnouncements) DB.cachedAnnouncements = null;
+  if (Array.isArray(DB.cachedAssignments)) SEED.assignments = DB.cachedAssignments;
+  if (Array.isArray(DB.cachedAnnouncements)) SEED.announcements = DB.cachedAnnouncements;
   let legacyCatalogDirty = false;
   if (typeof DB._catalogUpdatedAt !== "number") {
     // Legacy DB (created before this timestamp existed). If it already has
@@ -187,6 +191,10 @@ function persist() {
   // Subjects/modules/quizzes are written to their own relational rows by the
   // explicit save handlers (handleCreateSubjectSubmit / handleCreateModuleSubmit)
   // and delete handlers. This local write is only the offline cache.
+  // Cache current assignments & announcements so offline mode retains them
+  DB.cachedAssignments = SEED.assignments;
+  DB.cachedAnnouncements = SEED.announcements;
+
   try {
     localStorage.setItem(DB_KEY, JSON.stringify(DB));
   } catch (e) {
@@ -261,6 +269,10 @@ function applyRemoteCatalog(remoteData, remoteUpdatedAt, opts = {}) {
   _lastPushedCatalogJSON = incomingJSON;
   _catalogDirty = false;
   DB._catalogUpdatedAt = Math.max(remoteTs, localTs);
+  // Cache current assignments & announcements so offline mode retains them
+  DB.cachedAssignments = SEED.assignments;
+  DB.cachedAnnouncements = SEED.announcements;
+
   try {
     localStorage.setItem(DB_KEY, JSON.stringify(DB));
   } catch (e) {
@@ -445,11 +457,28 @@ async function refreshCatalogFromRelational() {
   if (typeof fetchCatalogFromSupabase !== "function") return false;
   const catalog = await fetchCatalogFromSupabase();
   if (!catalog) return false;
-  const changed = applyRelationalCatalog(catalog);
-  // These still live in their own relational tables (not the catalog blob).
-  if (catalog.assignments && catalog.assignments.length) SEED.assignments = catalog.assignments;
-  if (catalog.announcements && catalog.announcements.length) SEED.announcements = catalog.announcements;
-  if (catalog.teacherStudents && catalog.teacherStudents.length) SEED.teacherStudents = catalog.teacherStudents;
+  let changed = applyRelationalCatalog(catalog);
+  // These live in their own relational tables (assignments, announcements, teacher_students)
+  if (catalog.assignments && Array.isArray(catalog.assignments)) {
+    if (stableStringify(SEED.assignments) !== stableStringify(catalog.assignments)) {
+      SEED.assignments = catalog.assignments;
+      DB.cachedAssignments = catalog.assignments;
+      changed = true;
+    }
+  }
+  if (catalog.announcements && Array.isArray(catalog.announcements)) {
+    if (stableStringify(SEED.announcements) !== stableStringify(catalog.announcements)) {
+      SEED.announcements = catalog.announcements;
+      DB.cachedAnnouncements = catalog.announcements;
+      changed = true;
+    }
+  }
+  if (catalog.teacherStudents && Array.isArray(catalog.teacherStudents)) {
+    if (stableStringify(SEED.teacherStudents) !== stableStringify(catalog.teacherStudents)) {
+      SEED.teacherStudents = catalog.teacherStudents;
+      changed = true;
+    }
+  }
   try { localStorage.setItem(DB_KEY, JSON.stringify(DB)); } catch (e) { }
   if (changed) route();
   return changed;
@@ -985,6 +1014,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         if (idx >= 0) SEED.assignments[idx] = mapped;
         else SEED.assignments.push(mapped);
       }
+      persist();
       route();
       if (typeof toast === "function") toast("Na-update ang assignments — may bagong laman.", "info");
     });
@@ -1006,6 +1036,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         if (idx >= 0) SEED.announcements[idx] = mapped;
         else SEED.announcements.unshift(mapped);
       }
+      persist();
       route();
       if (typeof toast === "function") toast("Na-update ang announcements — may bagong laman.", "info");
     });
@@ -3162,7 +3193,8 @@ function renderStudentDashboard() {
   const contPage = inProgress ? inProgress[1].currentPage : 0;
   const contPct = contMod ? Math.round((contPage / Math.max(1, contMod.pages.length - 1)) * 100) : 0;
 
-  const upcoming = SEED.assignments.filter(a => a.status === "pending" && (user.subjects || []).includes(a.subjectId)).sort((a, b) => new Date(a.due) - new Date(b.due)).slice(0, 3);
+  const allowedSubIds = studentSubjects().map(s => s.id);
+  const upcoming = (SEED.assignments || []).filter(a => a.status === "pending" && allowedSubIds.includes(a.subjectId)).sort((a, b) => new Date(a.due) - new Date(b.due)).slice(0, 3);
   const recent = recentActivity();
 
   return `
@@ -4205,20 +4237,22 @@ function renderQuizResult(quizId) {
 function renderAssignments() {
   const user = currentUser();
   const ud = userData();
-  const items = SEED.assignments.filter(a => user.subjects.includes(a.subjectId) && SEED.subjects[a.subjectId]);
+  const allowedSubIds = studentSubjects().map(s => s.id);
+  const items = (SEED.assignments || []).filter(a => allowedSubIds.includes(a.subjectId) && allSubjects()[a.subjectId]);
   return `
     <div class="section-heading"><h2>Assignments</h2></div>
     <div class="card table-card">
       <table>
         <thead><tr><th>Assignment</th><th>Subject</th><th>Due</th><th>Points</th><th>Status</th><th>Score</th><th></th></tr></thead>
         <tbody>
-          ${items.map(a => {
+          ${items.length ? items.map(a => {
     const mySub = (ud.submissions || {})[a.id];
     const scoreDisplay = mySub && mySub.score !== undefined ? `${mySub.score}/${a.points}` : a.points;
+    const subjName = allSubjects()[a.subjectId]?.name || a.subjectId;
     return `
             <tr>
               <td>${a.title}</td>
-              <td>${SEED.subjects[a.subjectId].name}</td>
+              <td>${subjName}</td>
               <td class="num">${formatDate(a.due)}</td>
               <td class="num">${scoreDisplay}</td>
               <td>${mySub ? `<span class="pill pill-success">Submitted</span>` : `<span class="pill pill-warning">Pending</span>`}</td>
@@ -4228,7 +4262,7 @@ function renderAssignments() {
                 ${mySub ? `<a class="btn btn-danger btn-sm" style="margin-left:8px;" href="${mySub.fileData}" download="${mySub.fileName}">Download</a>` : ""}
               </td>
             </tr>`;
-  }).join("")}
+  }).join("") : `<tr><td colspan="7"><div class="empty-state"><p>No assignments posted yet.</p></div></td></tr>`}
         </tbody>
       </table>
     </div>
@@ -4239,16 +4273,17 @@ function renderGrades() {
   const ud = userData();
   const user = currentUser();
   const quizRows = Object.entries(ud.quizResults).map(([qid, r]) => {
-    const quiz = SEED.quizzes[qid];
+    const quiz = allQuizzes()[qid];
     if (!quiz) return null;
-    const subj = SEED.subjects[quiz.subjectId];
+    const subj = allSubjects()[quiz.subjectId];
     if (!subj) return null;
     return { subject: subj.name, activity: quiz.title, score: r.score, total: r.total, pct: r.percentage, status: r.passed ? "Passed" : "Failed" };
   }).filter(Boolean);
-  const assignRows = SEED.assignments.filter(a => user.subjects.includes(a.subjectId)).map(a => {
+  const allowedSubIds = studentSubjects().map(s => s.id);
+  const assignRows = (SEED.assignments || []).filter(a => allowedSubIds.includes(a.subjectId)).map(a => {
     const mySub = (ud.submissions || {})[a.id];
     if (!mySub) return null;
-    const subj = SEED.subjects[a.subjectId];
+    const subj = allSubjects()[a.subjectId];
     if (!subj) return null;
     const score = mySub.score !== undefined ? mySub.score : null;
     const total = a.points;
@@ -4322,12 +4357,14 @@ function renderBookmarks() {
   Object.entries(ud.progress).forEach(([mid, p]) => {
     (p.bookmarks || []).forEach(page => rows.push({ mid, page }));
   });
-  const validRows = rows.filter(r => SEED.modules[r.mid] && SEED.subjects[SEED.modules[r.mid].subjectId]);
+  const mods = allModules();
+  const subs = allSubjects();
+  const validRows = rows.filter(r => mods[r.mid] && subs[mods[r.mid].subjectId]);
   return `
     <div class="section-heading"><h2>Bookmarks</h2></div>
     ${validRows.length ? `<div class="module-list">${validRows.map(r => {
-    const mod = SEED.modules[r.mid];
-    const subject = SEED.subjects[mod.subjectId];
+    const mod = mods[r.mid];
+    const subject = subs[mod.subjectId] || { name: mod.subjectId };
     return `<div class="card module-card">
         <div class="module-num">${svgIcon("book")}</div>
         <div class="module-card-body"><h4>${mod.title}</h4><p>${subject.name} · Page ${r.page + 1} of ${mod.pages.length}</p></div>
@@ -4339,13 +4376,15 @@ function renderBookmarks() {
 
 function renderDownloads() {
   const ud = userData();
-  const entries = Object.entries(ud.downloads).filter(([mid]) => SEED.modules[mid] && SEED.subjects[SEED.modules[mid].subjectId]);
+  const mods = allModules();
+  const subs = allSubjects();
+  const entries = Object.entries(ud.downloads).filter(([mid]) => mods[mid] && subs[mods[mid].subjectId]);
   return `
     <div class="section-heading"><h2>Downloads</h2></div>
     <div class="kv-note">${svgIcon("download")} Downloaded modules stay available even when Offline Mode is simulated in Settings.</div>
     ${entries.length ? `<div class="card list-card">${entries.map(([mid, d]) => {
-    const mod = SEED.modules[mid];
-    const subject = SEED.subjects[mod.subjectId];
+    const mod = mods[mid];
+    const subject = subs[mod.subjectId] || { name: mod.subjectId };
     return `<div class="download-row">
         <span class="list-row-icon" style="background:var(--amber-soft); color:var(--amber);">${svgIcon("download")}</span>
         <div class="list-row-body" style="flex:1;"><p>${mod.title}</p><span>${subject.name} · Downloaded ${formatDate(d.date)}</span></div>
@@ -4444,7 +4483,7 @@ function renderProfile() {
 ========================================================= */
 function announcementsForStudent() {
   const user = currentUser();
-  const subIds = user.subjects || [];
+  const subIds = studentSubjects().map(s => s.id);
   return (SEED.announcements || []).filter(a => subIds.includes(a.subjectId)).sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || b.date - a.date);
 }
 
@@ -4459,7 +4498,7 @@ function renderAnnouncements() {
           <div class="announcement-card-header">
             <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
               <span class="ann-type-badge ann-type-${a.type}">${a.type === 'material' ? '📚 New Material' : a.type === 'deadline' ? '⏰ Deadline' : '📝 Quiz Schedule'}</span>
-              <span class="pill pill-muted">${SEED.subjects[a.subjectId]?.name || a.subjectId}</span>
+              <span class="pill pill-muted">${allSubjects()[a.subjectId]?.name || a.subjectId}</span>
               ${a.pinned ? '<span class="ann-pinned-badge">📌 Pinned</span>' : ''}
             </div>
             <span class="announcement-date">${formatDate(a.date)} (${timeAgo(a.date)})</span>
@@ -4481,9 +4520,9 @@ function renderAnnouncements() {
 
 function renderTeacherAnnouncements() {
   const user = currentUser();
-  const isAll = user.role === "admin" || !user.subjects;
-  const subIds = user.subjects || [];
-  const list = (SEED.announcements || []).filter(a => isAll || subIds.includes(a.subjectId)).sort((a, b) => b.date - a.date);
+  const isAll = user.role === "admin" || !user.subjects || user.subjects.length === 0;
+  const teacherSubIds = teacherSubjects().map(s => s.id);
+  const list = (SEED.announcements || []).filter(a => isAll || teacherSubIds.includes(a.subjectId)).sort((a, b) => b.date - a.date);
   return `
     <div class="section-heading">
       <h2>Announcements</h2>
@@ -4491,7 +4530,7 @@ function renderTeacherAnnouncements() {
     </div>
     <p style="color:var(--text-muted); margin-bottom:20px; font-size:14px;">Manage class announcements, quiz schedules, and learning material updates for your students.</p>
     <div class="announcement-list">
-      ${list.map(a => `
+      ${list.length ? list.map(a => `
         <div class="card announcement-card ${a.pinned ? 'pinned' : ''}">
           <div class="announcement-card-header">
             <div style="display:flex; align-items:center; gap:8px;">
@@ -4511,7 +4550,7 @@ function renderTeacherAnnouncements() {
             </div>
           </div>
         </div>
-      `).join("")}
+      `).join("") : `<div class="empty-state">${svgIcon("megaphone")}<h3>No announcements yet</h3><p>You haven't posted any announcements yet.</p></div>`}
     </div>
   `;
 }
