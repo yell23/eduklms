@@ -135,6 +135,25 @@ function buildFreshDB() {
   };
 }
 
+function deduplicateModulePages(pages) {
+  if (!Array.isArray(pages) || !pages.length) return pages || [];
+  const cleaned = [];
+  let hasCover = false;
+  let hasObjectives = false;
+  pages.forEach(p => {
+    if (!p) return;
+    if (p.type === "cover") {
+      if (hasCover) return;
+      hasCover = true;
+    } else if (p.type === "objectives") {
+      if (hasObjectives) return;
+      hasObjectives = true;
+    }
+    cleaned.push(p);
+  });
+  return cleaned;
+}
+
 function allSubjects() {
   const custom = (DB && DB.customSubjects) || {};
   if (DB && DB._relationalSynced) return custom;
@@ -384,8 +403,11 @@ function applyRelationalCatalog(catalog) {
     });
   }
   if (catalog.modules) {
-    Object.keys(SEED.modules || {}).forEach(id => {
+    Object.keys(catalog.modules || {}).forEach(id => {
       if (!catalog.modules[id]) delete SEED.modules[id];
+      else if (Array.isArray(catalog.modules[id].pages)) {
+        catalog.modules[id].pages = deduplicateModulePages(catalog.modules[id].pages);
+      }
     });
   }
   if (catalog.quizzes) {
@@ -852,6 +874,9 @@ function wireUserStateRealtime(email) {
     if (JSON.stringify(remoteState) === JSON.stringify(DB.perUser[email])) return;
     DB.perUser[email] = remoteState;
     localStorage.setItem(DB_KEY, JSON.stringify(DB));
+    // If the student is currently reading a booklet page, do NOT force-reroute the entire screen
+    // so page transitions and reading position don't reset or glitch
+    if (readerState && location.hash.startsWith("#/module/")) return;
     route();
   });
 }
@@ -3418,6 +3443,9 @@ function renderModuleReader(moduleId) {
     document.getElementById("view").innerHTML = `<div class="empty-state"><h3>Module not found</h3><p><a href="#/modules">Back to Modules</a></p></div>`;
     return;
   }
+  if (Array.isArray(mod.pages)) {
+    mod.pages = deduplicateModulePages(mod.pages);
+  }
   const subject = allSubjects()[mod.subjectId] || { name: "Subject", color: ["#A31832", "#E0293F"] };
   const ud = userData();
   const isOffline = ud.settings.simulateOffline || !navigator.onLine;
@@ -3801,17 +3829,21 @@ function closeImageLightbox() {
   document.body.classList.remove("lightbox-open");
 }
 
+let _isTurningPage = false;
 function turnPage(dir) {
+  if (_isTurningPage) return;
   const mod = allModules()[readerState.moduleId];
   if (!mod) return;
   const next = readerState.page + dir;
   if (next < 0 || next > mod.pages.length - 1) return;
   const el = document.getElementById("active-page");
   if (el) {
+    _isTurningPage = true;
     el.classList.add(dir > 0 ? "turning-next" : "turning-prev");
     setTimeout(() => {
       readerState.page = next;
       paintReaderPage(dir);
+      _isTurningPage = false;
     }, 260);
   } else {
     readerState.page = next;
@@ -5562,19 +5594,25 @@ function openModuleModal(moduleId = null, preselectedSubjectId = null) {
   if (isEditing && module) {
     document.getElementById("mod-title").value = module.title;
     document.getElementById("mod-desc").value = module.description;
-    document.getElementById("mod-objectives").value = module.steps?.join(", ") || "";
+    const objPage = (module.pages || []).find(p => p.type === "objectives");
+    if (objPage && Array.isArray(objPage.items)) {
+      document.getElementById("mod-objectives").value = objPage.items.join(", ");
+    } else {
+      document.getElementById("mod-objectives").value = module.steps?.join(", ") || "";
+    }
     document.getElementById("mod-mins").value = module.readingMins || 15;
     document.getElementById("mod-number").value = module.number;
     const modCoverEl = document.getElementById("mod-cover");
     if (modCoverEl) modCoverEl.value = module.coverImage || "";
 
-    // Load existing pages into builder
+    // Load existing pages into builder (exclude cover and objectives as they are auto-generated from module fields)
     builderPages = [];
     builderQuestions = [];
     document.getElementById("module-pages-builder-list").innerHTML = "";
     document.getElementById("module-quiz-builder-list").innerHTML = "";
 
     (module.pages || []).forEach((page, idx) => {
+      if (page.type === "cover" || page.type === "objectives") return;
       addPageItem(page.type, page);
     });
     (allQuizzes()[module.quizId]?.questions || []).forEach((q, idx) => {
@@ -6326,11 +6364,11 @@ async function handleCreateModuleSubmit(e) {
     const customImagesJSON = card.dataset.customImages;
 
     if (pageType === "cover" || card.querySelector(".bp-sub")) {
-      pages.push({ type: "cover", title: heading || "Module", sub: subText || `Module ${num} · ${subject.name}` });
+      // Cover is already placed as Page 0 from the form fields; skip duplicate
+      return;
     } else if (pageType === "objectives" || card.querySelector(".bp-objectives-list")) {
-      const items = objectivesText.split("\n").map(i => i.trim()).filter(Boolean);
-      pages.push({ type: "objectives", heading: heading || "Learning Objectives", items });
-      steps.push("Review Objectives");
+      // Objectives are already placed as Page 1 from the form fields; skip duplicate
+      return;
     } else if (pageType === "summary" || card.querySelector(".bp-summary-list")) {
       const items = summaryText.split("\n").map(i => i.trim()).filter(Boolean);
       pages.push({ type: "summary", heading: heading || "Summary", items });
@@ -6458,7 +6496,7 @@ async function handleCreateModuleSubmit(e) {
     readingMins: mins,
     quizId: quiz ? quizId : null,
     steps,
-    pages
+    pages: deduplicateModulePages(pages)
   };
 
   // Build the target subject with a fresh moduleIds array (never mutate SEED).
