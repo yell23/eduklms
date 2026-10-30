@@ -12,7 +12,7 @@
    next visit.
 ========================================================= */
 
-const CACHE_NAME  = "edubook-lms-v27";
+const CACHE_NAME  = "edubook-lms-v28";
 const SUPABASE_CDN = "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2";
 
 /* All files the app needs to render — even with zero network. */

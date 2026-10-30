@@ -17,6 +17,7 @@ ibang file na nag-a-assume na naka-configure na ito.
 1. Pumunta sa [supabase.com](https://supabase.com) → New Project (o buksan ang existing project).
 2. Sa **SQL Editor**, i-run ang updated:
    - `rls-policies.sql` (Inaayos ang Google sign-in support, permissions, `sync_user_profile`, at multi-device Realtime replication)
+   - `catalog-write-policies.sql` (**Kailangan ito** para maka-save ng subjects/modules/quizzes sa relational tables. Kung hindi ito na-run, ang bagong subject ay hindi maipapasok sa database at posibleng mawala sa ibang device.)
    - `storage-policies.sql` (Gumagawa ng public `materials` bucket para sa PDF/video/images/PowerPoint uploads — kailangan ito para hindi na ma-base64 sa localStorage ang malalaking files)
 3. Sa **Authentication → Providers** (sa Supabase dashboard):
    - I-enable ang **Google** provider kung gagamitin ang Google Sign-In (ilagay ang Google Client ID at Client Secret galing sa Google Cloud Console).

@@ -14,15 +14,33 @@ alter table if exists teacher_students enable row level security;
 alter table if exists user_state enable row level security;
 alter table if exists shared_state enable row level security;
 
--- 1. Catalog Read Policies (Drop first if exists to prevent 42710 error)
+-- 1. Catalog Policies (read + write — teachers/admins create content in-app)
 drop policy if exists "public read subjects" on subjects;
 create policy "public read subjects" on subjects for select using (true);
+drop policy if exists "public insert subjects" on subjects;
+create policy "public insert subjects" on subjects for insert with check (true);
+drop policy if exists "public update subjects" on subjects;
+create policy "public update subjects" on subjects for update using (true) with check (true);
+drop policy if exists "public delete subjects" on subjects;
+create policy "public delete subjects" on subjects for delete using (true);
 
 drop policy if exists "public read modules" on modules;
 create policy "public read modules" on modules for select using (true);
+drop policy if exists "public insert modules" on modules;
+create policy "public insert modules" on modules for insert with check (true);
+drop policy if exists "public update modules" on modules;
+create policy "public update modules" on modules for update using (true) with check (true);
+drop policy if exists "public delete modules" on modules;
+create policy "public delete modules" on modules for delete using (true);
 
 drop policy if exists "public read quizzes" on quizzes;
 create policy "public read quizzes" on quizzes for select using (true);
+drop policy if exists "public insert quizzes" on quizzes;
+create policy "public insert quizzes" on quizzes for insert with check (true);
+drop policy if exists "public update quizzes" on quizzes;
+create policy "public update quizzes" on quizzes for update using (true) with check (true);
+drop policy if exists "public delete quizzes" on quizzes;
+create policy "public delete quizzes" on quizzes for delete using (true);
 
 drop policy if exists "public read assignments" on assignments;
 create policy "public read assignments" on assignments for select using (true);
@@ -45,6 +63,8 @@ create policy "public delete teacher_students" on teacher_students for delete us
 -- 2. Schema Adjustments & Grants
 alter table if exists users alter column password drop not null;
 alter table if exists users alter column password set default '';
+-- Older deployments were created before subject cover images existed.
+alter table if exists subjects add column if not exists cover_image text;
 
 grant usage on schema public to anon, authenticated;
 grant all on all tables in schema public to anon, authenticated;
@@ -173,6 +193,15 @@ create policy "update shared state" on shared_state for update using (true);
 -- =========================================================
 do $$
 begin
+  if not exists (select 1 from pg_publication_tables where pubname = 'supabase_realtime' and tablename = 'subjects') then
+    alter publication supabase_realtime add table subjects;
+  end if;
+  if not exists (select 1 from pg_publication_tables where pubname = 'supabase_realtime' and tablename = 'modules') then
+    alter publication supabase_realtime add table modules;
+  end if;
+  if not exists (select 1 from pg_publication_tables where pubname = 'supabase_realtime' and tablename = 'quizzes') then
+    alter publication supabase_realtime add table quizzes;
+  end if;
   if not exists (select 1 from pg_publication_tables where pubname = 'supabase_realtime' and tablename = 'shared_state') then
     alter publication supabase_realtime add table shared_state;
   end if;

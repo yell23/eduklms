@@ -78,6 +78,112 @@ async function uploadMaterialSupabase(file, folder = "materials") {
 }
 
 /* =========================================================
+   CATALOG ROW MAPPERS
+   One row per subject/module/quiz. Keeping each entity in its own
+   row (instead of one shared JSON blob) is what stops a stale
+   device from overwriting — and deleting — content created on
+   another device.
+========================================================= */
+function catalogRowToSubject(s) {
+  return {
+    id: s.id, name: s.name, teacher: s.teacher, color: s.color, initial: s.initial,
+    description: s.description, objectives: s.objectives || [],
+    moduleIds: Array.isArray(s.module_ids) ? s.module_ids : [],
+    coverImage: s.cover_image || null
+  };
+}
+function catalogRowToModule(m) {
+  return {
+    id: m.id, subjectId: m.subject_id, number: m.number, title: m.title,
+    description: m.description, readingMins: m.reading_mins, quizId: m.quiz_id,
+    steps: m.steps || [], pages: m.pages || []
+  };
+}
+function catalogRowToQuiz(q) {
+  return {
+    id: q.id, moduleId: q.module_id, subjectId: q.subject_id, title: q.title,
+    questions: q.questions || []
+  };
+}
+
+function _subjectToRow(s) {
+  return {
+    id: s.id,
+    name: s.name,
+    teacher: s.teacher || null,
+    color: s.color || null,
+    initial: s.initial || null,
+    description: s.description || null,
+    objectives: Array.isArray(s.objectives) ? s.objectives : [],
+    module_ids: Array.isArray(s.moduleIds) ? s.moduleIds : [],
+    cover_image: s.coverImage || null
+  };
+}
+function _moduleToRow(m) {
+  return {
+    id: m.id,
+    subject_id: m.subjectId,
+    number: Number.isFinite(m.number) ? m.number : 1,
+    title: m.title || null,
+    description: m.description || null,
+    reading_mins: Number.isFinite(m.readingMins) ? m.readingMins : 0,
+    quiz_id: m.quizId || null,
+    steps: Array.isArray(m.steps) ? m.steps : [],
+    pages: Array.isArray(m.pages) ? m.pages : []
+  };
+}
+function _quizToRow(q) {
+  return {
+    id: q.id,
+    module_id: q.moduleId || null,
+    subject_id: q.subjectId || null,
+    title: q.title || null,
+    questions: Array.isArray(q.questions) ? q.questions : []
+  };
+}
+
+async function _upsertCatalogRow(table, row) {
+  const sb = getClient();
+  if (!sb) return { ok: false, reason: "offline" };
+  try {
+    const { error } = await withTimeout(sb.from(table).upsert(row), 20000);
+    if (error) {
+      console.warn(`Supabase ${table} upsert failed:`, error.message);
+      return { ok: false, reason: error.message || "error" };
+    }
+    return { ok: true };
+  } catch (e) {
+    console.warn(`Supabase ${table} upsert failed:`, e.message);
+    return { ok: false, reason: e.message || "error" };
+  }
+}
+
+async function _deleteCatalogRow(table, id) {
+  const sb = getClient();
+  if (!sb) return { ok: false, reason: "offline" };
+  try {
+    const { error } = await withTimeout(sb.from(table).delete().eq("id", id), 20000);
+    if (error) {
+      console.warn(`Supabase ${table} delete failed:`, error.message);
+      return { ok: false, reason: error.message || "error" };
+    }
+    return { ok: true };
+  } catch (e) {
+    console.warn(`Supabase ${table} delete failed:`, e.message);
+    return { ok: false, reason: e.message || "error" };
+  }
+}
+
+// Per-entity writes. Each save only touches its own row, so adding a
+// subject/module on one device can never erase another device's content.
+function upsertSubjectSupabase(subject) { return _upsertCatalogRow("subjects", _subjectToRow(subject)); }
+function upsertModuleSupabase(mod) { return _upsertCatalogRow("modules", _moduleToRow(mod)); }
+function upsertQuizSupabase(quiz) { return _upsertCatalogRow("quizzes", _quizToRow(quiz)); }
+function deleteSubjectSupabase(id) { return _deleteCatalogRow("subjects", id); }
+function deleteModuleSupabase(id) { return _deleteCatalogRow("modules", id); }
+function deleteQuizSupabase(id) { return _deleteCatalogRow("quizzes", id); }
+
+/* =========================================================
    CATALOG (subjects/modules/quizzes/assignments/announcements)
    Fetched once at boot. Returns null on any failure so app.js
    can fall back to the bundled data.js SEED object.
@@ -101,18 +207,9 @@ async function fetchCatalogFromSupabase() {
     if (anyError) { console.warn("Supabase catalog fetch error:", anyError.error); return null; }
 
     const bySubjects = {}, byModules = {}, byQuizzes = {};
-    subjects.data.forEach(s => bySubjects[s.id] = {
-      id: s.id, name: s.name, teacher: s.teacher, color: s.color, initial: s.initial,
-      description: s.description, objectives: s.objectives, moduleIds: s.module_ids
-    });
-    modules.data.forEach(m => byModules[m.id] = {
-      id: m.id, subjectId: m.subject_id, number: m.number, title: m.title,
-      description: m.description, readingMins: m.reading_mins, quizId: m.quiz_id,
-      steps: m.steps, pages: m.pages
-    });
-    quizzes.data.forEach(q => byQuizzes[q.id] = {
-      id: q.id, moduleId: q.module_id, subjectId: q.subject_id, title: q.title, questions: q.questions
-    });
+    subjects.data.forEach(s => bySubjects[s.id] = catalogRowToSubject(s));
+    modules.data.forEach(m => byModules[m.id] = catalogRowToModule(m));
+    quizzes.data.forEach(q => byQuizzes[q.id] = catalogRowToQuiz(q));
 
     return {
       subjects: bySubjects,
@@ -689,6 +786,39 @@ function subscribeSharedStateSupabase(onRemoteChange) {
     });
 
   return _sharedStateChannel;
+}
+
+/* =========================================================
+   REALTIME — catalog tables (subjects/modules/quizzes).
+   Each table is its own row, so a change on one device only
+   updates the affected entity instead of replacing the whole
+   catalog. Requires catalog-write-policies.sql to be run so
+   these tables are part of the supabase_realtime publication.
+========================================================= */
+let _catalogChannel = null;
+function subscribeCatalogSupabase(onRemoteChange) {
+  const sb = getClient();
+  if (!sb) return null;
+  if (_catalogChannel) return _catalogChannel;
+
+  const handler = (table) => (payload) => {
+    const row = payload.eventType === "DELETE" ? payload.old : payload.new;
+    onRemoteChange(table, payload.eventType, row || null);
+  };
+
+  _catalogChannel = sb
+    .channel("catalog_changes")
+    .on("postgres_changes", { event: "*", schema: "public", table: "subjects" }, handler("subjects"))
+    .on("postgres_changes", { event: "*", schema: "public", table: "modules" }, handler("modules"))
+    .on("postgres_changes", { event: "*", schema: "public", table: "quizzes" }, handler("quizzes"))
+    .subscribe((status) => {
+      if (status === "SUBSCRIBED") console.log("Realtime: listening for catalog changes");
+      if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+        console.warn("Realtime: catalog subscription failed (" + status + ") — falls back to load-time sync only");
+      }
+    });
+
+  return _catalogChannel;
 }
 
 /* Same idea for a single logged-in user's own progress row — lets a

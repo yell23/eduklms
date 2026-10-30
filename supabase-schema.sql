@@ -103,3 +103,7 @@ create table if not exists shared_state (
 );
 insert into shared_state (id, data) values ('global', '{"customSubjects":{},"customModules":{},"customQuizzes":{}}'::jsonb)
   on conflict (id) do nothing;
+
+-- ---------- FORWARD MIGRATIONS (safe to re-run on older deployments) ----------
+-- The app now stores a cover image on every subject row.
+alter table if exists subjects add column if not exists cover_image text;

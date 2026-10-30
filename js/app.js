@@ -50,6 +50,9 @@ function seedIfNeeded() {
   if (!DB.customSubjects) DB.customSubjects = {};
   if (!DB.customModules) DB.customModules = {};
   if (!DB.customQuizzes) DB.customQuizzes = {};
+  if (!DB._relationalIds || typeof DB._relationalIds !== "object") {
+    DB._relationalIds = { subjects: [], modules: [], quizzes: [] };
+  }
   if (!DB.cachedUsers) DB.cachedUsers = {};
   let legacyCatalogDirty = false;
   if (typeof DB._catalogUpdatedAt !== "number") {
@@ -154,29 +157,14 @@ let _catalogDirty = false;
 // that save user-visible content (module/subject editor) must check this so
 // they never show a "Saved!" toast for content that only lives in memory.
 function persist() {
-  // Never save/push an orphaned catalog: rebuild subject.moduleIds from each
+  // Never save an orphaned catalog: rebuild subject.moduleIds from each
   // module's own subjectId first. Skip while seed/reset wants the raw data.
   if (!_suppressCatalogPush) repairSubjectModuleLinks();
 
-  // Snapshot the shared catalog before saving. Only push it when it actually
-  // changed: persist() is called for lots of things unrelated to the catalog
-  // (progress, quiz answers, settings), and every push triggers a Realtime
-  // event that echoes back to this same tab.
-  let catalogSnapshot = null;
-  let catalogJSON = null;
-  let catalogChanged = false;
-  if (!_suppressCatalogPush && typeof pushSharedStateSupabase === "function") {
-    catalogSnapshot = {
-      customSubjects: DB.customSubjects, customModules: DB.customModules, customQuizzes: DB.customQuizzes
-    };
-    catalogJSON = JSON.stringify(catalogSnapshot);
-    catalogChanged = catalogJSON !== _lastPushedCatalogJSON;
-    if (catalogChanged) {
-      DB._catalogUpdatedAt = Date.now();
-      _catalogDirty = true;
-    }
-  }
-
+  // NOTE: catalog content is no longer pushed as one shared JSON blob here.
+  // Subjects/modules/quizzes are written to their own relational rows by the
+  // explicit save handlers (handleCreateSubjectSubmit / handleCreateModuleSubmit)
+  // and delete handlers. This local write is only the offline cache.
   try {
     localStorage.setItem(DB_KEY, JSON.stringify(DB));
   } catch (e) {
@@ -185,38 +173,6 @@ function persist() {
     return false;
   }
 
-  if (catalogChanged && typeof isSupabaseConfigured === "function" && !isSupabaseConfigured()) {
-    // Pure-local mode (no Supabase configured): nothing to push, so treat it
-    // as clean immediately instead of leaving a permanently "dirty" catalog.
-    _lastPushedCatalogJSON = catalogJSON;
-    _catalogDirty = false;
-  } else if (catalogChanged && !canPushCatalog()) {
-    // Only teachers/admins may write the shared catalog. A student device
-    // must never push its (possibly stale) copy over the teacher's content —
-    // that was the other half of why modules could vanish after a refresh.
-    _lastPushedCatalogJSON = catalogJSON;
-    _catalogDirty = false;
-  } else if (catalogChanged) {
-    // Mark clean only after the push actually succeeds. If it fails (offline,
-    // server error), _catalogDirty stays true so the online/visibility sync
-    // can retry instead of silently losing the change.
-    pushSharedStateSupabase(catalogSnapshot, (ok, serverUpdatedAt) => {
-      if (!ok) return;
-      const stillCurrentJSON = JSON.stringify({
-        customSubjects: DB.customSubjects || {},
-        customModules: DB.customModules || {},
-        customQuizzes: DB.customQuizzes || {}
-      });
-      if (stillCurrentJSON !== catalogJSON) return; // newer edits queued their own push
-      _lastPushedCatalogJSON = catalogJSON;
-      _catalogDirty = false;
-      const serverTs = Date.parse(serverUpdatedAt || "") || 0;
-      if (serverTs) {
-        DB._catalogUpdatedAt = serverTs;
-        try { localStorage.setItem(DB_KEY, JSON.stringify(DB)); } catch (e) { }
-      }
-    });
-  }
   if (typeof pushUserStateSupabase === "function") {
     const u = currentUser();
     if (u && DB.perUser[u.email]) pushUserStateSupabase(u.email, DB.perUser[u.email]);
@@ -306,12 +262,11 @@ function canPushCatalog() {
 
 /* =========================================================
    CATALOG INTEGRITY REPAIR
-   A subject's moduleIds is the ONLY thing that makes its modules
-   render. If an older/stale tab pushes a full catalog snapshot where
-   the module exists in customModules but the subject's moduleIds is
-   empty, the module "disappears" on the next refresh even though it
-   was saved. This rebuilds those links from each module's own
-   subjectId, so the catalog is self-healing.
+   A subject's moduleIds is what makes its modules render. Instead of
+   trusting the stored array (which can go stale when two devices add
+   modules at once), derive it from each module's own subjectId. The
+   modules table is the single source of truth, so a module can never
+   be "lost" just because a subject's array didn't get updated.
 ========================================================= */
 function repairSubjectModuleLinks() {
   if (!DB) return false;
@@ -320,54 +275,32 @@ function repairSubjectModuleLinks() {
 
   const subjects = allSubjects();
   const modules = allModules();
-  let changed = false;
 
-  const originalLists = {};
-  Object.keys(subjects).forEach((sid) => {
-    const subject = subjects[sid];
-    originalLists[sid] = subject && Array.isArray(subject.moduleIds) ? subject.moduleIds.slice() : null;
+  // Group every module under its subject, ordered by module number then id.
+  const bySubject = {};
+  Object.keys(modules).forEach((mid) => {
+    const mod = modules[mid];
+    if (!mod || !mod.subjectId) return;
+    if (!bySubject[mod.subjectId]) bySubject[mod.subjectId] = [];
+    bySubject[mod.subjectId].push(mod);
   });
 
-  // 1) Normalize: must be an array, no duplicates, no IDs for deleted modules.
+  let changed = false;
   Object.keys(subjects).forEach((sid) => {
     const subject = subjects[sid];
     if (!subject || typeof subject !== "object") return;
-    const original = Array.isArray(subject.moduleIds) ? subject.moduleIds : [];
-    const cleaned = [];
-    original.forEach((mid) => {
-      if (modules[mid] && !cleaned.includes(mid)) cleaned.push(mid);
-    });
-    if (!Array.isArray(subject.moduleIds) || cleaned.length !== original.length) {
-      subject.moduleIds = cleaned;
-      changed = true;
-    }
-  });
-
-  // 2) Every custom module must be listed under its own subject.
-  Object.keys(DB.customModules).forEach((mid) => {
-    const mod = DB.customModules[mid];
-    if (!mod || !mod.subjectId) return;
-    const subject = subjects[mod.subjectId];
-    if (!subject) return;
-    if (!Array.isArray(subject.moduleIds)) subject.moduleIds = [];
-    if (!subject.moduleIds.includes(mid)) {
-      subject.moduleIds.push(mid);
-      changed = true;
-    }
-  });
-
-  // 3) Save the repaired lists. Custom subjects were mutated in place; SEED
-  //    subjects need a custom override so the links survive a refresh.
-  Object.keys(subjects).forEach((sid) => {
-    const subject = subjects[sid];
-    if (!subject) return;
-    const list = Array.isArray(subject.moduleIds) ? subject.moduleIds : [];
-    const before = originalLists[sid] || [];
-    if (JSON.stringify(before) === JSON.stringify(list)) return;
+    const list = (bySubject[sid] || [])
+      .slice()
+      .sort((a, b) => (Number(a.number) || 0) - (Number(b.number) || 0) || String(a.id).localeCompare(String(b.id)))
+      .map((m) => m.id);
+    const current = Array.isArray(subject.moduleIds) ? subject.moduleIds : null;
+    const same = current && current.length === list.length && current.every((id, i) => id === list[i]);
+    if (same) return;
     changed = true;
     if (DB.customSubjects[sid]) {
       DB.customSubjects[sid].moduleIds = list;
     } else {
+      // SEED subject: store a custom override so the links survive a refresh.
       DB.customSubjects[sid] = { ...subject, moduleIds: list };
     }
   });
@@ -400,6 +333,222 @@ function applyRemoteCatalogAndRepair(remoteData, remoteUpdatedAt, opts = {}) {
   return true;
 }
 
+/* =========================================================
+   RELATIONAL CATALOG (subjects/modules/quizzes tables)
+
+   These tables are the source of truth. Each entity is its own row,
+   so adding a subject/module on one device can never overwrite (and
+   delete) content created on another device. The local DB.custom*
+   objects stay as an offline cache only.
+========================================================= */
+
+// Order-insensitive JSON comparison, so semantically-equal objects with a
+// different key order aren't treated as changed on every refresh.
+function stableStringify(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return "[" + value.map(stableStringify).join(",") + "]";
+  return "{" + Object.keys(value).sort().map((k) => JSON.stringify(k) + ":" + stableStringify(value[k])).join(",") + "}";
+}
+
+// Merge a relational catalog snapshot into the local cache. Rows that
+// were previously known to come from the cloud but are now gone (deleted
+// on another device) are removed; everything else is updated in place.
+function applyRelationalCatalog(catalog) {
+  if (!catalog) return false;
+  DB.customSubjects = DB.customSubjects || {};
+  DB.customModules = DB.customModules || {};
+  DB.customQuizzes = DB.customQuizzes || {};
+  const prev = DB._relationalIds || { subjects: [], modules: [], quizzes: [] };
+  let changed = false;
+
+  const dropMissing = (store, prevIds, incoming) => {
+    (prevIds || []).forEach((id) => {
+      if (!incoming[id] && Object.prototype.hasOwnProperty.call(store, id)) {
+        delete store[id];
+        changed = true;
+      }
+    });
+  };
+  dropMissing(DB.customSubjects, prev.subjects, catalog.subjects || {});
+  dropMissing(DB.customModules, prev.modules, catalog.modules || {});
+  dropMissing(DB.customQuizzes, prev.quizzes, catalog.quizzes || {});
+
+  const mergeRows = (store, incoming) => {
+    Object.keys(incoming || {}).forEach((id) => {
+      const next = incoming[id];
+      if (stableStringify(store[id]) !== stableStringify(next)) {
+        store[id] = next;
+        changed = true;
+      }
+    });
+  };
+  mergeRows(DB.customSubjects, catalog.subjects);
+  mergeRows(DB.customModules, catalog.modules);
+  mergeRows(DB.customQuizzes, catalog.quizzes);
+
+  DB._relationalIds = {
+    subjects: Object.keys(catalog.subjects || {}),
+    modules: Object.keys(catalog.modules || {}),
+    quizzes: Object.keys(catalog.quizzes || {})
+  };
+
+  if (repairSubjectModuleLinks()) changed = true;
+  return changed;
+}
+
+// Re-fetch the relational catalog and update the local cache/render.
+async function refreshCatalogFromRelational() {
+  if (typeof fetchCatalogFromSupabase !== "function") return false;
+  const catalog = await fetchCatalogFromSupabase();
+  if (!catalog) return false;
+  const changed = applyRelationalCatalog(catalog);
+  // These still live in their own relational tables (not the catalog blob).
+  if (catalog.assignments && catalog.assignments.length) SEED.assignments = catalog.assignments;
+  if (catalog.announcements && catalog.announcements.length) SEED.announcements = catalog.announcements;
+  if (catalog.teacherStudents && catalog.teacherStudents.length) SEED.teacherStudents = catalog.teacherStudents;
+  try { localStorage.setItem(DB_KEY, JSON.stringify(DB)); } catch (e) { }
+  if (changed) route();
+  return changed;
+}
+
+// Legacy bridge: older builds stored runtime content in shared_state as one
+// JSON blob. Before the first relational migration, pull any IDs we don't
+// already have locally into DB.custom* so nothing is lost. It never
+// overwrites an existing local/relational row.
+async function importLegacySharedCatalog() {
+  if (typeof fetchSharedStateSupabase !== "function") return false;
+  const shared = await fetchSharedStateSupabase();
+  if (!shared || !shared.data) return false;
+  const d = shared.data;
+  DB.customSubjects = DB.customSubjects || {};
+  DB.customModules = DB.customModules || {};
+  DB.customQuizzes = DB.customQuizzes || {};
+  let changed = false;
+  const addMissing = (store, incoming) => {
+    Object.keys(incoming || {}).forEach((id) => {
+      if (!store[id]) { store[id] = incoming[id]; changed = true; }
+    });
+  };
+  addMissing(DB.customSubjects, d.customSubjects);
+  addMissing(DB.customModules, d.customModules);
+  addMissing(DB.customQuizzes, d.customQuizzes);
+  return changed;
+}
+
+// One-time, idempotent copy of every locally-known entity into the relational
+// tables. Only IDs that don't exist in the cloud yet are inserted, so it can
+// never overwrite a newer row created on another device.
+async function migrateLocalCatalogToRelational() {
+  if (typeof fetchCatalogFromSupabase !== "function") return { ok: false, skipped: true };
+  if (typeof upsertSubjectSupabase !== "function") return { ok: false, skipped: true };
+  if (typeof isSupabaseConfigured === "function" && !isSupabaseConfigured()) return { ok: false, skipped: true };
+
+  const existing = await fetchCatalogFromSupabase();
+  if (!existing) return { ok: false, skipped: true };
+
+  const haveSubjects = new Set(Object.keys(existing.subjects || {}));
+  const haveModules = new Set(Object.keys(existing.modules || {}));
+  const haveQuizzes = new Set(Object.keys(existing.quizzes || {}));
+  const subjects = allSubjects();
+  const modules = allModules();
+  const quizzes = allQuizzes();
+  let ok = true;
+  let migrated = 0;
+
+  const ensureSubject = async (sid) => {
+    if (!sid || haveSubjects.has(sid) || !subjects[sid]) return;
+    const res = await upsertSubjectSupabase({ ...subjects[sid], id: sid });
+    if (res.ok) { haveSubjects.add(sid); migrated++; }
+    else ok = false;
+  };
+  const ensureModule = async (mid) => {
+    if (!mid || haveModules.has(mid) || !modules[mid]) return;
+    const mod = modules[mid];
+    if (mod.subjectId && !subjects[mod.subjectId]) {
+      console.warn(`Skipping orphaned module ${mid}: subject ${mod.subjectId} not found.`);
+      return;
+    }
+    await ensureSubject(mod.subjectId);
+    const res = await upsertModuleSupabase({ ...mod, id: mid });
+    if (res.ok) { haveModules.add(mid); migrated++; }
+    else ok = false;
+  };
+
+  for (const sid of Object.keys(subjects)) await ensureSubject(sid);
+  for (const mid of Object.keys(modules)) await ensureModule(mid);
+  for (const qid of Object.keys(quizzes)) {
+    if (haveQuizzes.has(qid)) continue;
+    const quiz = quizzes[qid];
+    if (quiz.moduleId && !modules[quiz.moduleId]) {
+      console.warn(`Skipping orphaned quiz ${qid}: module ${quiz.moduleId} not found.`);
+      continue;
+    }
+    if (quiz.moduleId) await ensureModule(quiz.moduleId);
+    if (quiz.subjectId && !subjects[quiz.subjectId]) {
+      console.warn(`Skipping orphaned quiz ${qid}: subject ${quiz.subjectId} not found.`);
+      continue;
+    }
+    const res = await upsertQuizSupabase({ ...quiz, id: qid });
+    if (res.ok) { haveQuizzes.add(qid); migrated++; }
+    else ok = false;
+  }
+  return { ok, migrated };
+}
+
+// Apply a single realtime row change (subjects/modules/quizzes) locally.
+function handleCatalogRealtimeChange(table, eventType, row) {
+  if (!row) return;
+  DB.customSubjects = DB.customSubjects || {};
+  DB.customModules = DB.customModules || {};
+  DB.customQuizzes = DB.customQuizzes || {};
+  let changed = false;
+
+  const upsertLocal = (store, id, value) => {
+    if (!id) return;
+    if (stableStringify(store[id]) !== stableStringify(value)) {
+      store[id] = value;
+      changed = true;
+    }
+  };
+  const removeLocal = (store, id) => {
+    if (id && Object.prototype.hasOwnProperty.call(store, id)) {
+      delete store[id];
+      changed = true;
+    }
+  };
+
+  if (table === "subjects") {
+    if (eventType === "DELETE") removeLocal(DB.customSubjects, row.id);
+    else upsertLocal(DB.customSubjects, row.id, catalogRowToSubject(row));
+  } else if (table === "modules") {
+    if (eventType === "DELETE") removeLocal(DB.customModules, row.id);
+    else upsertLocal(DB.customModules, row.id, catalogRowToModule(row));
+  } else if (table === "quizzes") {
+    if (eventType === "DELETE") removeLocal(DB.customQuizzes, row.id);
+    else upsertLocal(DB.customQuizzes, row.id, catalogRowToQuiz(row));
+  }
+
+  if (repairSubjectModuleLinks()) changed = true;
+  if (changed) {
+    try { localStorage.setItem(DB_KEY, JSON.stringify(DB)); } catch (e) { }
+    route();
+  }
+}
+
+// Best-effort upsert of every locally-known catalog entity. Used after the
+// legacy inline-file migration rewrites cover/image URLs, so the cleaned
+// values reach the relational rows (and therefore other devices) too.
+async function pushAllLocalCatalogToRelational() {
+  if (typeof upsertSubjectSupabase !== "function") return;
+  if (typeof isSupabaseConfigured === "function" && !isSupabaseConfigured()) return;
+  const subjects = allSubjects();
+  const modules = allModules();
+  const quizzes = allQuizzes();
+  for (const sid of Object.keys(subjects)) await upsertSubjectSupabase({ ...subjects[sid], id: sid });
+  for (const mid of Object.keys(modules)) await upsertModuleSupabase({ ...modules[mid], id: mid });
+  for (const qid of Object.keys(quizzes)) await upsertQuizSupabase({ ...quizzes[qid], id: qid });
+}
+
 async function pushLocalCatalogNow() {
   if (typeof pushSharedStateSupabaseImmediate !== "function") return { ok: false, reason: "unavailable" };
   // Never push an orphaned catalog: rebuild subject.moduleIds first so every
@@ -421,20 +570,21 @@ async function pushLocalCatalogNow() {
 }
 
 async function syncCatalogFromCloud(force = false) {
-  if (typeof fetchSharedStateSupabase !== "function") return false;
-  const shared = await fetchSharedStateSupabase();
-  if (!shared) return false;
-  const changed = applyRemoteCatalogAndRepair(shared.data, shared.updatedAt, { force });
-  if (changed) {
-    route();
-    if (typeof toast === "function") toast("Na-update ang content — may bagong laman.", "info");
+  // If the first boot happened offline, finish the one-time legacy import and
+  // relational migration as soon as connectivity returns.
+  if (!DB._catalogMigratedToTables && typeof migrateLocalCatalogToRelational === "function") {
+    if (typeof importLegacySharedCatalog === "function" && await importLegacySharedCatalog()) {
+      repairSubjectModuleLinks();
+    }
+    const migration = await migrateLocalCatalogToRelational();
+    if (migration && migration.ok) {
+      DB._catalogMigratedToTables = true;
+      try { localStorage.setItem(DB_KEY, JSON.stringify(DB)); } catch (e) { }
+    }
   }
-  // Local edits/repairs are still unsynced (e.g. made while offline) — push
-  // them now that we're back online. Students never push catalog snapshots.
-  if (_catalogDirty && canPushCatalog()) {
-    await pushLocalCatalogNow();
-  }
-  return changed;
+  // Catalog is read from the relational tables, never from the legacy
+  // shared_state blob. This cannot overwrite or delete another device's rows.
+  return refreshCatalogFromRelational();
 }
 
 /* =========================================================
@@ -530,6 +680,7 @@ async function migrateInlineDataUrlsToStorage() {
   }
 
   if (changed) {
+    await pushAllLocalCatalogToRelational();
     persist();
     route();
     toast("Na-migrate ang malalaking naka-embed na files sa cloud storage.", "info");
@@ -679,49 +830,28 @@ function wireUserStateRealtime(email) {
    BOOT / SCREEN SWITCH
 ========================================================= */
 document.addEventListener("DOMContentLoaded", async () => {
-  // Try Supabase for the course catalog first; on any failure (offline, not
-  // configured, timeout) this silently returns null and SEED just keeps the
-  // data.js content that's already loaded — same offline-first behavior as before.
-  if (typeof fetchCatalogFromSupabase === "function") {
-    const catalog = await fetchCatalogFromSupabase();
-    if (catalog) {
-      Object.assign(SEED.subjects, catalog.subjects);
-      Object.assign(SEED.modules, catalog.modules);
-      Object.assign(SEED.quizzes, catalog.quizzes);
-      if (catalog.assignments.length) SEED.assignments = catalog.assignments;
-      if (catalog.announcements.length) SEED.announcements = catalog.announcements;
-      if (catalog.teacherStudents.length) SEED.teacherStudents = catalog.teacherStudents;
-    }
-  }
-
   seedIfNeeded();
-  // Heal any orphaned module links already in localStorage (e.g. the tab was
-  // closed before a repair push completed) before the first render, so modules
-  // stay visible even when the device is offline.
+  // Heal any orphaned module links already in localStorage before the first
+  // render, so modules stay visible even when the device is offline.
   repairSubjectModuleLinks();
 
-  // Sync the shared catalog (subjects/modules/quizzes) with Supabase. The
-  // cloud copy is authoritative when it is newer; genuinely newer local
-  // edits (e.g. a save made while offline) win and get pushed instead. This
-  // replaces the old "only fill in keys we don't have" merge, which meant a
-  // student that had already cached a subject never received its new
-  // moduleIds — so newly uploaded modules stayed invisible forever.
-  if (typeof fetchSharedStateSupabase === "function") {
-    const shared = await fetchSharedStateSupabase();
-    if (shared) {
-      const remoteTs = Date.parse(shared.updatedAt || "") || 0;
-      const applied = applyRemoteCatalogAndRepair(shared.data, shared.updatedAt);
-      // A genuinely newer local catalog (e.g. saved while offline) still needs
-      // to be pushed back. Content that is equal but happens to have an older
-      // server timestamp is treated as clean by repair/apply above.
-      if (!applied && (Number(DB._catalogUpdatedAt) || 0) > remoteTs) {
-        _catalogDirty = true;
-      }
-      if (_catalogDirty && canPushCatalog()) {
-        await pushLocalCatalogNow();
-      }
+  // First boot after this update: bring in any legacy shared_state content and
+  // copy every locally-known entity into the relational tables. Only IDs that
+  // don't exist in the cloud are inserted, so this can never overwrite a newer
+  // row created on another device.
+  if (!DB._catalogMigratedToTables && typeof fetchCatalogFromSupabase === "function") {
+    if (await importLegacySharedCatalog()) repairSubjectModuleLinks();
+    const migration = await migrateLocalCatalogToRelational();
+    if (migration && migration.ok) {
+      DB._catalogMigratedToTables = true;
+      try { localStorage.setItem(DB_KEY, JSON.stringify(DB)); } catch (e) { }
     }
   }
+
+  // The relational tables (subjects/modules/quizzes) are the source of truth.
+  // On any failure (offline / not configured) this keeps the local cache.
+  await refreshCatalogFromRelational();
+
   // A remembered teacher/admin session was already synced above; a fresh
   // login (or a role switch to teacher) will fire maybeSyncCatalogAfterLogin()
   // from route() instead.
@@ -741,21 +871,12 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (document.visibilityState === "visible") syncCatalogFromCloud();
   });
 
-  // REALTIME: listen for subjects/modules/quizzes added or edited by anyone
-  // else (any device, any tab). No reload needed — replaces the whole cloud
-  // snapshot so additions, edits, and deletions all propagate.
-  if (typeof subscribeSharedStateSupabase === "function") {
-    subscribeSharedStateSupabase((sharedData, sharedUpdatedAt) => {
-      // Don't let a remote echo (possibly of an older in-flight push) wipe
-      // edits that haven't been confirmed by the server yet. The pending
-      // push will settle it; the next focus/online sync catches anything
-      // genuinely newer.
-      if (_catalogDirty) return;
-      const changed = applyRemoteCatalogAndRepair(sharedData, sharedUpdatedAt, { force: true });
-      if (changed) {
-        route();
-        if (typeof toast === "function") toast("Na-update ang content — may bagong laman.", "info");
-      }
+  // REALTIME: each catalog row (subject/module/quiz) is its own table row, so
+  // an add/edit/delete on any device updates only that entity locally instead
+  // of replacing the whole catalog.
+  if (typeof subscribeCatalogSupabase === "function") {
+    subscribeCatalogSupabase((table, eventType, row) => {
+      handleCatalogRealtimeChange(table, eventType, row);
     });
   }
 
@@ -1857,29 +1978,46 @@ function handleGlobalKeydown(e) {
 /* =========================================================
    DELETE OPERATIONS
 ========================================================= */
-function deleteSubject(subjectId) {
+async function deleteSubject(subjectId) {
   const subject = allSubjects()[subjectId];
   if (!subject) return;
 
-  const moduleIds = subject.moduleIds || [];
+  const moduleIds = Array.isArray(subject.moduleIds) ? subject.moduleIds.slice() : [];
+
+  // Delete the row first; the modules/quizzes rows cascade in the database.
+  if (typeof isSupabaseConfigured === "function" && isSupabaseConfigured() && typeof deleteSubjectSupabase === "function") {
+    const res = await deleteSubjectSupabase(subjectId);
+    if (!res.ok) {
+      toast(`Could not delete subject from the database (${res.reason}). Please try again.`, "danger");
+      return;
+    }
+  }
 
   delete DB.customSubjects[subjectId];
 
-  moduleIds.forEach(modId => {
-    delete DB.customModules[modId];
-    const quiz = allQuizzes()[modId];
-    if (quiz) delete DB.customQuizzes[quiz.id];
+  // Remove every module that belongs to this subject (moduleIds may be stale,
+  // so also match by each module's own subjectId).
+  const removedModuleIds = new Set(moduleIds);
+  Object.keys(DB.customModules || {}).forEach(mid => {
+    const m = DB.customModules[mid];
+    if (m && m.subjectId === subjectId) removedModuleIds.add(mid);
+  });
+  removedModuleIds.forEach(mid => { delete DB.customModules[mid]; });
+  // Remove any quiz that belongs to one of this subject's modules.
+  Object.keys(DB.customQuizzes || {}).forEach(qid => {
+    const q = DB.customQuizzes[qid];
+    if (q && (q.subjectId === subjectId || removedModuleIds.has(q.moduleId))) delete DB.customQuizzes[qid];
   });
 
   Object.values(DB.perUser).forEach(ud => {
-    moduleIds.forEach(modId => {
+    removedModuleIds.forEach(modId => {
       delete ud.progress[modId];
       delete ud.quizResults[modId];
       delete ud.downloads[modId];
       const bookmarkIdx = ud.bookmarksOrder?.indexOf(modId);
       if (bookmarkIdx > -1) ud.bookmarksOrder.splice(bookmarkIdx, 1);
     });
-    ud.completedModules = (ud.completedModules || []).filter(m => !moduleIds.includes(m));
+    ud.completedModules = (ud.completedModules || []).filter(m => !removedModuleIds.has(m));
   });
 
   persist();
@@ -2157,11 +2295,38 @@ function handleEditUserSubmit(e) {
   route();
 }
 
-function deleteModule(moduleId) {
+async function deleteModule(moduleId) {
   const mod = allModules()[moduleId];
   if (!mod) return;
 
   const subject = allSubjects()[mod.subjectId];
+
+  // Delete the rows first (quiz, then module). The subject's moduleIds is
+  // derived from the modules table, so it self-heals after this.
+  if (typeof isSupabaseConfigured === "function" && isSupabaseConfigured()) {
+    if (mod.quizId && typeof deleteQuizSupabase === "function") {
+      const qres = await deleteQuizSupabase(mod.quizId);
+      if (!qres.ok) {
+        toast(`Could not delete the module quiz from the database (${qres.reason}). Please try again.`, "danger");
+        return;
+      }
+    }
+    if (typeof deleteModuleSupabase === "function") {
+      const res = await deleteModuleSupabase(moduleId);
+      if (!res.ok) {
+        toast(`Could not delete module from the database (${res.reason}). Please try again.`, "danger");
+        return;
+      }
+    }
+    if (subject && typeof upsertSubjectSupabase === "function") {
+      const updatedSubject = {
+        ...subject,
+        id: subject.id || mod.subjectId,
+        moduleIds: (Array.isArray(subject.moduleIds) ? subject.moduleIds : []).filter(id => id !== moduleId)
+      };
+      await upsertSubjectSupabase(updatedSubject);
+    }
+  }
 
   delete DB.customModules[moduleId];
   if (mod.quizId) delete DB.customQuizzes[mod.quizId];
@@ -2169,6 +2334,7 @@ function deleteModule(moduleId) {
   if (subject && subject.moduleIds) {
     subject.moduleIds = subject.moduleIds.filter(id => id !== moduleId);
   }
+  repairSubjectModuleLinks();
 
   Object.values(DB.perUser).forEach(ud => {
     delete ud.progress[moduleId];
@@ -5205,20 +5371,7 @@ function resetSystemToDefaults() {
 async function forceCloudSyncSupabase() {
   toast("Synchronizing with Supabase...", "info");
   try {
-    if (typeof pushSharedStateSupabaseImmediate === "function") {
-      await pushLocalCatalogNow();
-    }
-    if (typeof fetchCatalogFromSupabase === "function") {
-      const catalog = await fetchCatalogFromSupabase();
-      if (catalog) {
-        Object.assign(SEED.subjects, catalog.subjects);
-        Object.assign(SEED.modules, catalog.modules);
-        Object.assign(SEED.quizzes, catalog.quizzes);
-        if (catalog.assignments.length) SEED.assignments = catalog.assignments;
-        if (catalog.announcements.length) SEED.announcements = catalog.announcements;
-        if (catalog.teacherStudents.length) SEED.teacherStudents = catalog.teacherStudents;
-      }
-    }
+    await refreshCatalogFromRelational();
     persist();
     toast("Cloud synchronization complete! Everything up to date.", "success");
     route();
@@ -6028,74 +6181,61 @@ async function handleCreateSubjectSubmit(e) {
   const coverImage = (document.getElementById("subj-cover")?.value || "").trim();
 
   const isEditing = !!editingSubjectId;
-  const subjectId = editingSubjectId || code || `subj_${Date.now()}`;
-
-  if (isEditing) {
-    // Update existing subject
-    const existingSubject = allSubjects()[editingSubjectId];
-    if (existingSubject) {
-      const subject = {
-        ...existingSubject,
-        name,
-        teacher,
-        color,
-        coverImage: coverImage || existingSubject.coverImage || null,
-        initial: (code.substring(0, 2) || name.substring(0, 2)).toUpperCase(),
-        description: desc,
-        objectives,
-        moduleIds: existingSubject.moduleIds || []
-      };
-
-      DB.customSubjects = DB.customSubjects || {};
-
-      // If ID changed, move it to the new key
-      if (subjectId !== editingSubjectId) {
-        delete DB.customSubjects[editingSubjectId];
-        subject.id = subjectId;
-
-        // Update module references
-        (subject.moduleIds || []).forEach(modId => {
-          const mod = allModules()[modId];
-          if (mod) {
-            DB.customModules = DB.customModules || {};
-            DB.customModules[modId] = { ...mod, subjectId };
-          }
-        });
-      }
-
-      DB.customSubjects[subjectId] = subject;
-    }
-  } else {
-    // Create new subject
-    const newSubject = {
-      id: subjectId,
-      name,
-      teacher,
-      color,
-      coverImage: coverImage || null,
-      initial: (code.substring(0, 2) || name.substring(0, 2)).toUpperCase(),
-      description: desc,
-      objectives,
-      moduleIds: []
-    };
-
-    DB.customSubjects = DB.customSubjects || {};
-    DB.customSubjects[subjectId] = newSubject;
+  const existingSubject = isEditing ? allSubjects()[editingSubjectId] : null;
+  if (isEditing && !existingSubject) {
+    toast("Subject not found.", "danger");
+    return;
   }
 
-  // Only report success once it actually reached localStorage. persist()
-  // shows its own error toast and returns false on quota failure.
+  // Stable, collision-free ID. Editing keeps the original ID so module links
+  // and foreign keys are never broken; new subjects get a unique suffix if
+  // the code is already taken.
+  let subjectId;
+  if (isEditing) {
+    subjectId = editingSubjectId;
+  } else {
+    const base = code || `subj_${Date.now()}`;
+    subjectId = base;
+    let suffix = 1;
+    while (allSubjects()[subjectId] || (DB.customSubjects && DB.customSubjects[subjectId])) {
+      subjectId = `${base}-${suffix++}`;
+    }
+  }
+
+  const subject = {
+    ...(existingSubject || {}),
+    id: subjectId,
+    name,
+    teacher,
+    color,
+    coverImage: coverImage || existingSubject?.coverImage || null,
+    initial: (code.substring(0, 2) || name.substring(0, 2)).toUpperCase(),
+    description: desc,
+    objectives,
+    moduleIds: Array.isArray(existingSubject?.moduleIds) ? existingSubject.moduleIds.slice() : []
+  };
+
+  // Online-required: write the row to the database first. If that fails we do
+  // not claim success, so the UI never shows content that isn't persisted.
+  if (typeof isSupabaseConfigured === "function" && isSupabaseConfigured()) {
+    if (typeof upsertSubjectSupabase !== "function") {
+      toast("Cloud sync is unavailable right now. Please reload and try again.", "danger");
+      return;
+    }
+    const saved = await upsertSubjectSupabase(subject);
+    if (!saved.ok) {
+      toast(`Could not save subject to the database (${saved.reason}). Please check your connection and try again.`, "danger");
+      return;
+    }
+  }
+
+  DB.customSubjects = DB.customSubjects || {};
+  DB.customSubjects[subjectId] = subject;
+  repairSubjectModuleLinks();
+
   if (!persist()) return;
 
-  let pushed = { ok: true };
-  if (typeof isSupabaseConfigured === "function" && isSupabaseConfigured()) {
-    pushed = await pushLocalCatalogNow();
-  }
-  if (pushed.ok) {
-    toast(isEditing ? `Subject "${name}" successfully updated!` : `Subject "${name}" successfully created!`, "success");
-  } else {
-    toast(`Subject saved on this device, but cloud sync failed (${pushed.reason}). Students may not see it yet.`, "warning");
-  }
+  toast(isEditing ? `Subject "${name}" successfully updated!` : `Subject "${name}" successfully created!`, "success");
   closeAllModals();
   route();
 }
@@ -6116,11 +6256,19 @@ async function handleCreateModuleSubmit(e) {
 
   const subject = allSubjects()[subjectId];
   if (!subject) { toast("Subject not found.", "danger"); return; }
-  if (!Array.isArray(subject.moduleIds)) subject.moduleIds = [];
 
   const isEditing = !!editingModuleId;
-  const modId = editingModuleId || `m-${subjectId}-${num}-${Date.now().toString().slice(-4)}`;
-  const quizId = `q-${subjectId}-${num}-${Date.now().toString().slice(-4)}`;
+  const existingModule = isEditing ? allModules()[editingModuleId] : null;
+  if (isEditing && !existingModule) {
+    toast("Module not found.", "danger");
+    return;
+  }
+  // Collision-free IDs: the old Date.now().slice(-4) repeated every 10
+  // seconds, so quick successive adds could overwrite each other.
+  const unique = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const modId = editingModuleId || `m-${subjectId}-${num}-${unique}`;
+  const existingQuizId = existingModule?.quizId || null;
+  const quizId = existingQuizId || `q-${subjectId}-${num}-${unique}`;
   const modCoverImage = (document.getElementById("mod-cover")?.value || "").trim();
 
   const pages = [
@@ -6244,6 +6392,7 @@ async function handleCreateModuleSubmit(e) {
     }
   });
 
+  let quiz = null;
   if (questions.length) {
     pages.push({
       type: "quiz-page",
@@ -6256,8 +6405,7 @@ async function handleCreateModuleSubmit(e) {
     });
     steps.push("Take Quiz");
 
-    DB.customQuizzes = DB.customQuizzes || {};
-    DB.customQuizzes[quizId] = {
+    quiz = {
       id: quizId,
       moduleId: modId,
       subjectId,
@@ -6268,109 +6416,96 @@ async function handleCreateModuleSubmit(e) {
 
   steps.push("Complete Lesson");
 
-  if (isEditing) {
-    // Update existing module
-    const existingModule = allModules()[editingModuleId];
-    if (existingModule) {
-      // Preserve quiz ID if it exists
-      const existingQuizId = existingModule.quizId;
-      const oldSubjectId = existingModule.subjectId;
+  const oldSubjectId = existingModule?.subjectId || null;
 
-      // IMPORTANT: existingModule may be a direct reference into SEED.modules
-      // (when editing one of the original bundled modules, not a
-      // teacher/admin-created one). Mutating it in place only changes the
-      // in-memory SEED copy for this tab/session — it's never written to
-      // DB.customModules, so persist() has nothing new to save to
-      // localStorage or push to Supabase, and the edit is lost on reload.
-      // Always write the updated module into DB.customModules so the
-      // override sticks and gets synced, regardless of where it originally
-      // came from.
-      const updatedModule = {
-        ...existingModule,
-        subjectId,
-        number: num,
-        title,
-        description: desc,
-        readingMins: mins,
-        quizId: questions.length ? (existingQuizId || quizId) : null,
-        steps,
-        pages
+  const updatedModule = {
+    ...(existingModule || {}),
+    id: modId,
+    subjectId,
+    number: num,
+    title,
+    description: desc,
+    readingMins: mins,
+    quizId: quiz ? quizId : null,
+    steps,
+    pages
+  };
+
+  // Build the target subject with a fresh moduleIds array (never mutate SEED).
+  const updatedSubject = {
+    ...subject,
+    id: subjectId,
+    moduleIds: Array.isArray(subject.moduleIds) ? subject.moduleIds.slice() : []
+  };
+  if (!updatedSubject.moduleIds.includes(modId)) updatedSubject.moduleIds.push(modId);
+
+  // If the module moved to another subject, remove it from the old subject.
+  let oldSubject = null;
+  if (oldSubjectId && oldSubjectId !== subjectId) {
+    const old = allSubjects()[oldSubjectId];
+    if (old) {
+      oldSubject = {
+        ...old,
+        id: oldSubjectId,
+        moduleIds: (Array.isArray(old.moduleIds) ? old.moduleIds : []).filter(id => id !== modId)
       };
-      DB.customModules = DB.customModules || {};
-      DB.customModules[editingModuleId] = updatedModule;
-
-      // Update quiz if questions changed
-      if (questions.length && existingQuizId && DB.customQuizzes[existingQuizId]) {
-        DB.customQuizzes[existingQuizId] = {
-          ...DB.customQuizzes[existingQuizId],
-          moduleId: modId,
-          subjectId,
-          title: `Module ${num} Assessment: ${title}`,
-          questions
-        };
-      }
-
-      // Move module to different subject if needed
-      if (oldSubjectId !== subjectId) {
-        const oldSubject = allSubjects()[oldSubjectId];
-        if (oldSubject && oldSubject.moduleIds) {
-          oldSubject.moduleIds = oldSubject.moduleIds.filter(id => id !== editingModuleId);
-          DB.customSubjects = DB.customSubjects || {};
-          DB.customSubjects[oldSubjectId] = { ...oldSubject, moduleIds: oldSubject.moduleIds };
-        }
-      }
-
-      // ALWAYS make sure the target subject points at this module. The old
-      // code only did this for brand-new modules, so moving an edited module
-      // to another subject (or editing one whose subject.moduleIds was empty)
-      // left it invisible to students in that subject.
-      if (!subject.moduleIds.includes(editingModuleId)) {
-        subject.moduleIds.push(editingModuleId);
-      }
-      DB.customSubjects = DB.customSubjects || {};
-      DB.customSubjects[subjectId] = { ...subject, moduleIds: subject.moduleIds };
-    }
-  } else {
-    // Create new module
-    const newModule = {
-      id: modId,
-      subjectId,
-      number: num,
-      title,
-      description: desc,
-      readingMins: mins,
-      quizId: questions.length ? quizId : null,
-      steps,
-      pages
-    };
-
-    DB.customModules = DB.customModules || {};
-    DB.customModules[modId] = newModule;
-
-    if (!subject.moduleIds.includes(modId)) {
-      subject.moduleIds.push(modId);
-      if (DB.customSubjects && DB.customSubjects[subjectId]) {
-        DB.customSubjects[subjectId].moduleIds = subject.moduleIds;
-      } else {
-        DB.customSubjects = DB.customSubjects || {};
-        DB.customSubjects[subjectId] = { ...subject };
-      }
     }
   }
 
-  // Only report success once it actually reached localStorage. persist()
-  // shows its own error toast and returns false on quota failure.
+  // Online-required: persist the rows in FK-safe order (subject → module → quiz).
+  // Nothing is applied locally until the database write actually succeeds.
+  if (typeof isSupabaseConfigured === "function" && isSupabaseConfigured()) {
+    if (typeof upsertSubjectSupabase !== "function" || typeof upsertModuleSupabase !== "function") {
+      toast("Cloud sync is unavailable right now. Please reload and try again.", "danger");
+      return;
+    }
+    const subjectSaved = await upsertSubjectSupabase(updatedSubject);
+    if (!subjectSaved.ok) {
+      toast(`Could not save the subject link to the database (${subjectSaved.reason}). Please try again.`, "danger");
+      return;
+    }
+    if (oldSubject) {
+      const oldSaved = await upsertSubjectSupabase(oldSubject);
+      if (!oldSaved.ok) {
+        toast(`Could not update the old subject in the database (${oldSaved.reason}). Please try again.`, "danger");
+        return;
+      }
+    }
+    const moduleSaved = await upsertModuleSupabase(updatedModule);
+    if (!moduleSaved.ok) {
+      toast(`Could not save module to the database (${moduleSaved.reason}). Please check your connection and try again.`, "danger");
+      return;
+    }
+    if (quiz) {
+      const quizSaved = await upsertQuizSupabase(quiz);
+      if (!quizSaved.ok) {
+        toast(`Module saved but the quiz failed to save (${quizSaved.reason}). Please try again.`, "danger");
+        return;
+      }
+    }
+    if (isEditing && existingQuizId && !quiz && typeof deleteQuizSupabase === "function") {
+      await deleteQuizSupabase(existingQuizId);
+    }
+  }
+
+  // Apply locally only after the database write succeeded (or when Supabase
+  // isn't configured, preserving the pure-local demo behavior).
+  DB.customModules = DB.customModules || {};
+  DB.customQuizzes = DB.customQuizzes || {};
+  DB.customSubjects = DB.customSubjects || {};
+  DB.customModules[modId] = updatedModule;
+  DB.customSubjects[subjectId] = updatedSubject;
+  if (oldSubject) DB.customSubjects[oldSubjectId] = oldSubject;
+  if (quiz) {
+    DB.customQuizzes[quizId] = quiz;
+  } else if (isEditing && existingQuizId) {
+    delete DB.customQuizzes[existingQuizId];
+  }
+  repairSubjectModuleLinks();
+
   if (!persist()) return;
 
-  let pushed = { ok: true };
-  if (typeof isSupabaseConfigured === "function" && isSupabaseConfigured()) {
-    pushed = await pushLocalCatalogNow();
-  }
-  if (pushed.ok) {
-    toast(isEditing ? `Module "${title}" successfully updated!` : `Module "${title}" successfully published!`, "success");
-  } else {
-    toast(`Module saved on this device, but cloud sync failed (${pushed.reason}). Students may not see it yet.`, "warning");
-  }
+  toast(isEditing ? `Module "${title}" successfully updated!` : `Module "${title}" successfully published!`, "success");
   closeAllModals();
   route();
 }
